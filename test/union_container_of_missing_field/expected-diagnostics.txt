@@ -1,0 +1,5 @@
+# One expectation per line: a substring of a message PAL must report,
+# optionally prefixed with `<file>.c:<line>: ` to pin it to a source location.
+no field missing in union storage
+_container_of expects a struct or union type
+unsupported bit-field in union

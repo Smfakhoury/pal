@@ -167,6 +167,9 @@ fn module_for_name(name: &Name) -> Option<String> {
         Name::UnionGhostFieldProj(u, _) => Some(format!("Union_{}", u)),
         Name::UnionFieldProj(u, _) => Some(format!("Union_{}", u)),
         Name::UnionFieldAddr(u, _) => Some(format!("Union_{}", u)),
+        Name::UnionContainerFn(u, _) => Some(format!("Union_{}", u)),
+        Name::UnionContainerInv(u, _) => Some(format!("Union_{}", u)),
+        Name::UnionProjContainerInv(u, _) => Some(format!("Union_{}", u)),
         Name::UnionAuxFn(u, _, _) => Some(format!("Union_{}", u)),
         Name::UnionActivateFn(u, _) => Some(format!("Union_{}", u)),
         Name::TypeRefDefault(TypeRef::Struct(s)) => Some(format!("Struct_{}", s)),
@@ -510,6 +513,9 @@ enum Name {
     /// Address of a union arm (`&u.arm`), computed without the arm being
     /// active and without granting any ownership.
     UnionFieldAddr(Rc<IdentT>, Rc<IdentT>),
+    UnionContainerFn(Rc<IdentT>, Rc<IdentT>),
+    UnionContainerInv(Rc<IdentT>, Rc<IdentT>),
+    UnionProjContainerInv(Rc<IdentT>, Rc<IdentT>),
     UnionAuxFn(Rc<IdentT>, &'static str, Rc<IdentT>),
     /// Ghost axiom (`assume val ... : stt_ghost ...`) that activates a union
     /// arm, used before a partial sub-field write `u->arm.field = v`.
@@ -593,6 +599,13 @@ impl Name {
             Name::UnionGhostFieldProj(u, fld) => format!("{}__{}", union_to_string(u), fld),
             Name::UnionFieldProj(u, fld) => format!("{}__get_{}", union_to_string(u), fld),
             Name::UnionFieldAddr(u, fld) => format!("{}__addr_{}", union_to_string(u), fld),
+            Name::UnionContainerFn(u, fld) => format!("{}__{}_container", union_to_string(u), fld),
+            Name::UnionContainerInv(u, fld) => {
+                format!("{}__{}_container_inv", union_to_string(u), fld)
+            }
+            Name::UnionProjContainerInv(u, fld) => {
+                format!("{}__{}_proj_container_inv", union_to_string(u), fld)
+            }
             Name::UnionAuxFn(u, f, fld) => format!("{}__aux_{}_{}", union_to_string(u), f, fld),
             Name::UnionActivateFn(u, fld) => {
                 format!("{}__activate_{}", union_to_string(u), fld)
@@ -2107,6 +2120,7 @@ impl<'a> Emitter<'a> {
                 }
             }
             ExprT::Cond(cond, then_expr, else_expr) => {
+                let nullable_guard = self.nullable_guard(env, cond);
                 let mut cond_doc = self.emit_short_circuit_expr(env, cond);
                 let branches_need_stmt = self.expr_reads_mutable_local(env, cond)
                     || self.expr_reads_mutable_local(env, then_expr)
@@ -2120,18 +2134,59 @@ impl<'a> Emitter<'a> {
                         cond_doc.prelude.push(bind);
                         cond_doc.expr = tmp;
                     }
-                    let then_doc = self.emit_short_circuit_expr(env, then_expr);
-                    let else_doc = self.emit_short_circuit_expr(env, else_expr);
-                    let body = self.emit_if_statement_expr(
-                        cond_doc.expr,
-                        Self::block_with_final(then_doc.prelude, then_doc.expr),
-                        Self::block_with_final(else_doc.prelude, else_doc.expr),
-                    );
+                    let mut then_doc = self.emit_short_circuit_expr(env, then_expr);
+                    let mut else_doc = self.emit_short_circuit_expr(env, else_expr);
                     let ty_doc = env
                         .infer_expr(e)
                         .ok()
                         .map(|ty| self.emit_type(env, &ty))
                         .unwrap_or_else(|| Doc::text("_"));
+                    // Read/call binders need their source typedef spelling,
+                    // but both branches must return the same syntactic type.
+                    // Bind once, then reconcile definitionally equal aliases
+                    // through a pure, explicitly typed identity.
+                    for (branch, expr) in [(&mut then_doc, then_expr), (&mut else_doc, else_expr)] {
+                        let branch_ty = env
+                            .infer_expr(expr)
+                            .ok()
+                            .map(|ty| self.emit_type(env, &ty))
+                            .unwrap_or_else(|| ty_doc.clone());
+                        let (tmp, bind) =
+                            self.emit_short_circuit_binding(branch_ty, branch.expr.clone());
+                        branch.prelude.push(bind);
+                        branch.expr = parens(
+                            Doc::text("id #")
+                                .append(parens(ty_doc.clone()))
+                                .append(" ")
+                                .append(tmp),
+                        );
+                    }
+                    let (then_block, else_block) = if let Some(guard) = &nullable_guard {
+                        (
+                            self.nullable_guarded_value_block(
+                                env,
+                                guard,
+                                true,
+                                then_doc.prelude,
+                                then_doc.expr,
+                                ty_doc.clone(),
+                            ),
+                            self.nullable_guarded_value_block(
+                                env,
+                                guard,
+                                false,
+                                else_doc.prelude,
+                                else_doc.expr,
+                                ty_doc.clone(),
+                            ),
+                        )
+                    } else {
+                        (
+                            Self::block_with_final(then_doc.prelude, then_doc.expr),
+                            Self::block_with_final(else_doc.prelude, else_doc.expr),
+                        )
+                    };
+                    let body = self.emit_if_statement_expr(cond_doc.expr, then_block, else_block);
                     let (tmp, bind) = self.emit_short_circuit_binding(ty_doc, body);
                     cond_doc.prelude.push(bind);
                     ShortCircuitExpr {
@@ -5970,9 +6025,43 @@ impl<'a> Emitter<'a> {
                             ));
                             parens(unaryfn(container, self.emit_rvalue(env, ptr)))
                         }
+                        TypeT::TypeRef(TypeRefKind::Union(union_name)) => {
+                            let container = self.emit_name(Name::UnionContainerFn(
+                                union_name.val.clone(),
+                                field.val.clone(),
+                            ));
+                            if let ExprT::Ref(member) = &ptr.val
+                                && let ExprT::Member(base, member_field) = &member.val
+                                && member_field.val == field.val
+                                && let Ok(base_ty) = env.infer_expr(base)
+                                && let TypeT::TypeRef(TypeRefKind::Union(base_name)) =
+                                    &env.vtype_whnf(base_ty).val
+                                && base_name.val == union_name.val
+                                && env
+                                    .lookup_union(union_name)
+                                    .and_then(|u| {
+                                        u.fields.iter().find(|f| f.val.name().val == field.val)
+                                    })
+                                    .is_some_and(|f| !f.val.is_array())
+                                && let ExprKind::LValue(base_doc) = self.emit_expr(env, base)
+                            {
+                                return parens(unaryfn(
+                                    self.emit_name(Name::UnionAuxFn(
+                                        union_name.val.clone(),
+                                        "container_roundtrip",
+                                        field.val.clone(),
+                                    )),
+                                    base_doc,
+                                ));
+                            }
+                            parens(unaryfn(container, self.emit_rvalue(env, ptr)))
+                        }
                         _ => {
                             self.report(
-                                format!("_container_of expects a struct type, got {}", struct_ty),
+                                format!(
+                                    "_container_of expects a struct or union type, got {}",
+                                    struct_ty
+                                ),
                                 &struct_ty.loc,
                             );
                             Doc::text("(admit())")
@@ -6554,7 +6643,31 @@ impl<'a> Emitter<'a> {
         let saved = std::mem::take(&mut self.pending_prelude);
         let saved_rows = std::mem::take(&mut self.pending_rows);
         let (before, after) = self.nullable_arg_ghosts(env, stmt);
-        let core = self.emit_stmt_core(env, stmt);
+        let mut deferred_return = None;
+        let core = if !after.is_empty()
+            && let StmtT::Return(Some(value)) = &stmt.val
+            && let Ok(ty) = env.infer_expr(value)
+        {
+            // Call cleanup needs the callee's postcondition while it is still
+            // in scope, before the enclosing function discharges its return.
+            let name = loop {
+                let name: Rc<str> = Rc::from(format!("__pal_return_{}", self.tmp_counter));
+                self.tmp_counter += 1;
+                if !self.nm.map.contains_key(&Name::Var(name.clone()))
+                    && !self.nm.used.contains(&name)
+                {
+                    break name;
+                }
+            };
+            let id = name.clone().with_loc(stmt.loc.clone());
+            let binding: Rc<Stmt> =
+                StmtT::Let(id, ty.to_rc(), value.clone()).with_loc(stmt.loc.clone());
+            let core = self.emit_stmt_core(env, &binding);
+            deferred_return = Some(self.emit_name(Name::Var(name)));
+            core
+        } else {
+            self.emit_stmt_core(env, stmt)
+        };
         let prelude = std::mem::replace(&mut self.pending_prelude, saved);
         self.pending_rows = saved_rows;
         let mut doc = prelude
@@ -6566,6 +6679,13 @@ impl<'a> Emitter<'a> {
         doc = doc.append(core);
         for g in after {
             doc = doc.append(Doc::hardline()).append(g);
+        }
+        if let Some(value) = deferred_return {
+            doc = doc
+                .append(Doc::hardline())
+                .append("return ")
+                .append(value)
+                .append(";");
         }
         doc
     }
@@ -8072,46 +8192,51 @@ impl<'a> Emitter<'a> {
     /// pointer that is not `_nullable` -- that pointer owns its pointee
     /// outright and has no `unless_null` to open.
     fn nullable_guard(&self, env: &Env, cond: &Expr) -> Option<NullableGuard> {
-        match &cond.val {
+        let (pointer, then_is_nonnull) = match &cond.val {
             ExprT::UnOp(UnOp::Not, inner) => {
                 let guard = self.nullable_guard(env, inner)?;
-                Some(NullableGuard {
+                return Some(NullableGuard {
                     then_is_nonnull: !guard.then_is_nonnull,
                     ..guard
-                })
+                });
             }
             ExprT::BinOp(BinOp::Eq, lhs, rhs) => {
                 match &rhs.val {
                     ExprT::IntLit(n, _) if **n == BigInt::ZERO => {}
                     _ => return None,
                 }
-                let ty = env.infer_expr(lhs).ok()?;
-                let TypeT::Nullable(inner) = &ty.val else {
-                    return None;
-                };
-                let inner: Rc<Type> = inner.clone().into();
-                let whnf = env.vtype_whnf(inner.clone().into());
-                let array = match &whnf.val {
-                    TypeT::Pointer(_, PointerKind::Ref | PointerKind::Unknown) => false,
-                    TypeT::Pointer(_, PointerKind::Array | PointerKind::ArrayPtr) => true,
-                    // A `core_ref` carries no ownership and a function pointer
-                    // keeps ordinary `pts_to`, so neither has an `unless_null`.
-                    _ => return None,
-                };
-                let mode = match &lhs.val {
-                    ExprT::Var(n) => self.current_fn_param_modes.get(&n.val).copied(),
-                    _ => None,
-                };
-                Some(NullableGuard {
-                    pointer: lhs.clone(),
-                    inner,
-                    array,
-                    then_is_nonnull: false,
-                    mode,
-                })
+                (lhs, false)
             }
+            ExprT::Cast(pointer, ty)
+                if matches!(env.vtype_whnf(ty.clone().into()).val, TypeT::Bool) =>
+            {
+                (pointer, true)
+            }
+            _ => return None,
+        };
+        let ty = env.infer_expr(pointer).ok()?;
+        let TypeT::Nullable(inner) = &ty.val else {
+            return None;
+        };
+        let inner: Rc<Type> = inner.clone().into();
+        let whnf = env.vtype_whnf(inner.clone().into());
+        let array = match &whnf.val {
+            TypeT::Pointer(_, PointerKind::Ref | PointerKind::Unknown) => false,
+            TypeT::Pointer(_, PointerKind::Array | PointerKind::ArrayPtr) => true,
+            // Raw/function pointers carry no `unless_null` ownership.
+            _ => return None,
+        };
+        let mode = match &pointer.val {
+            ExprT::Var(n) => self.current_fn_param_modes.get(&n.val).copied(),
             _ => None,
-        }
+        };
+        Some(NullableGuard {
+            pointer: pointer.clone(),
+            inner,
+            array,
+            then_is_nonnull,
+            mode,
+        })
     }
 } // impl Emitter (group C)
 
@@ -9745,6 +9870,71 @@ impl<'a> Emitter<'a> {
             ));
         }
 
+        // Like struct projections, these are address-level primitives of the
+        // PAL memory model, not casts between stored values. Neither inverse
+        // grants ownership nor asserts that an arm is active.
+        for f in fields
+            .iter()
+            .filter(|f| !matches!(f.val, FieldT::BitField { .. }))
+        {
+            let fld = f.val.name();
+            let projected_type = self.emit_field_projection_type(env, f);
+            let container =
+                self.emit_name(Name::UnionContainerFn(name.val.clone(), fld.val.clone()));
+            let projection = self.emit_name(ghost_fld(fld));
+            ses.push(mk_assume_val(
+                vec![],
+                container.clone(),
+                &[parens(
+                    Doc::text("r:")
+                        .append(Doc::line())
+                        .append(projected_type.clone()),
+                )],
+                ref_union_type.clone(),
+            ));
+            for (lemma, arg, arg_type, roundtrip) in [
+                (
+                    Name::UnionContainerInv(name.val.clone(), fld.val.clone()),
+                    "x",
+                    ref_union_type.clone(),
+                    unaryfn(
+                        container.clone(),
+                        unaryfn(projection.clone(), Doc::text("x")),
+                    ),
+                ),
+                (
+                    Name::UnionProjContainerInv(name.val.clone(), fld.val.clone()),
+                    "r",
+                    projected_type,
+                    unaryfn(
+                        projection.clone(),
+                        unaryfn(container.clone(), Doc::text("r")),
+                    ),
+                ),
+            ] {
+                ses.push(mk_assume_val(
+                    vec![],
+                    self.emit_name(lemma),
+                    &[parens(
+                        Doc::text(format!("{}:", arg))
+                            .append(Doc::line())
+                            .append(arg_type),
+                    )],
+                    Doc::text("Lemma")
+                        .append(Doc::line())
+                        .append(parens(
+                            Doc::text("ensures ")
+                                .append(roundtrip.clone())
+                                .append(format!(" == {}", arg)),
+                        ))
+                        .append(Doc::line())
+                        .append(Doc::text("[SMTPat ").append(roundtrip).append("]"))
+                        .nest(2)
+                        .group(),
+                ));
+            }
+        }
+
         // Per-field unfold: requires pts_to x #p vx ** pure (Field_foo__x? vx)
         // gives back unfolded token plus the field's `pts_to` clause
         // tying the ghost projection to the active constructor's
@@ -9934,9 +10124,10 @@ impl<'a> Emitter<'a> {
         for f in fields.iter().filter(|f| !f.val.is_array()) {
             let fld = f.val.name();
             let ret_type = self.emit_field_projection_type(env, f);
+            let addr = self.emit_name(Name::UnionFieldAddr(name.val.clone(), fld.val.clone()));
             ses.push(mk_assume_val(
                 vec![Doc::text("pulse_impure_spec_no_proof_required")],
-                self.emit_name(Name::UnionFieldAddr(name.val.clone(), fld.val.clone())),
+                addr.clone(),
                 &[parens(
                     Doc::text("x:")
                         .append(Doc::line())
@@ -9944,7 +10135,7 @@ impl<'a> Emitter<'a> {
                 )],
                 naryfn([
                     Doc::text("stt_atomic"),
-                    ret_type,
+                    ret_type.clone(),
                     Doc::text("#PulseCore.Observability.Neutral"),
                     Doc::text("emp_inames"),
                     Doc::text("emp"),
@@ -9957,7 +10148,40 @@ impl<'a> Emitter<'a> {
                         ]),
                     ),
                 ]),
-            ))
+            ));
+            if matches!(f.val, FieldT::BitField { .. }) {
+                continue;
+            }
+            // Check the executable round trip and return a matcher-visible
+            // alias. A bare SMT inverse does not let the frame matcher use
+            // the original union's ownership through the recovered pointer.
+            let container = unaryfn(
+                self.emit_name(Name::UnionContainerFn(name.val.clone(), fld.val.clone())),
+                Doc::text("r"),
+            );
+            ses.push(
+                Doc::text("atomic fn ")
+                    .append(self.emit_name(Name::UnionAuxFn(
+                        name.val.clone(),
+                        "container_roundtrip",
+                        fld.val.clone(),
+                    )))
+                    .append(" ")
+                    .append(parens(Doc::text("x: ").append(ref_union_type.clone())))
+                    .append(Doc::hardline())
+                    .append("requires emp")
+                    .append(Doc::hardline())
+                    .append("returns r: ")
+                    .append(ref_union_type.clone())
+                    .append(Doc::hardline())
+                    .append("ensures rewrites_to r x")
+                    .append(Doc::hardline())
+                    .append("{ let r = ")
+                    .append(unaryfn(addr, Doc::text("x")))
+                    .append("; ")
+                    .append(container)
+                    .append(" }"),
+            );
         }
 
         // Ghost-axiom activation lemma for each arm.

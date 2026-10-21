@@ -1,0 +1,3 @@
+variadic_aggregate_effects.c:9: unsupported ignored variadic argument
+variadic_aggregate_effects.c:13: unsupported ignored variadic argument
+variadic_aggregate_effects.c:17: unsupported ignored variadic argument

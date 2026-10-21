@@ -1,0 +1,6 @@
+Func_missing_tail_ownership
+Func_missing_call_ownership
+Func_missing_call_precondition
+Func_bad_contract
+Func_reversed_null_guard
+Func_conditional_overflow

@@ -15,6 +15,33 @@ This doc explains how structs are modelled in pal. Whenever you define a struct 
 
 Unions are emitted analogously to `Union_foo.fst`, with a sum-type constructor in place of the record. See [`unions.md`](unions.md) for the full picture.
 
+## Recovering a named union from a member address
+
+`_container_of(p, union U, member)` (also through a typedef) uses the existing
+union representation. PAL checks that the member exists and is not a bit-field.
+It emits the per-member `union_U__member_container` address primitive and two
+round-trip laws against the existing ghost projection:
+`container (projection u) == u` and `projection (container p) == p`.
+Inline-array members use their existing array handle, not a cast to a scalar
+reference. These address primitives and laws, like struct field-address laws,
+are **trusted assumptions of PAL's C memory model**, not proofs of physical
+layout in Pulse. No values, active-arm facts, or ownership are fabricated.
+
+For a direct `_container_of(&u->member, union U, member)` with a non-array
+member, PAL emits a checked atomic accessor which executes the member-address operation followed by the
+container operation and proves `rewrites_to result u`. This lets Pulse's frame
+matcher preserve and reuse ownership through the returned alias without asking
+it to discover an SMT equality. The specialization requires the same named union
+and member; it evaluates the base once. Other uses emit the container primitive
+directly, including uses in contracts. Ownership still must come from the caller,
+and reading an arm still requires that arm to be active. If the address and
+container operations are separated into different statements, explicit proof
+rewriting can still be needed to relate the two heap addresses.
+
+See [`test/union_container_of`](../test/union_container_of) for native C round
+trips, an owning update and exact-value read, and negative ownership, active-arm,
+and functional-postcondition checks.
+
 ## Typedefs that wrap a struct
 
 A `typedef struct ... name;` produces **two** files: one for the struct body and one for the alias.

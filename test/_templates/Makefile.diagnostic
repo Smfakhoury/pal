@@ -22,9 +22,15 @@ PAL_OPTS += $(INCLUDES)
 
 all: verify compile
 
+ifneq ($(wildcard compile_commands.json.in),)
+COMPILE_DB := compile_commands.json
+compile_commands.json: compile_commands.json.in
+	python3 -c 'import os,pathlib; p=pathlib.Path("$<"); pathlib.Path("$@").write_text(p.read_text().replace("@TEST_DIRECTORY@", os.getcwd()))'
+endif
+
 translate: $(OUT_DIR)/.stamp
 
-$(OUT_DIR)/.stamp: $(C_FILES) $(H_FILES) $(C2PULSE) pal.h
+$(OUT_DIR)/.stamp: $(C_FILES) $(H_FILES) $(C2PULSE) pal.h $(COMPILE_DB)
 	@mkdir -p $(OUT_DIR)
 	$(C2PULSE) $(PAL_OPTS) --outdir $(OUT_DIR) $(C_FILES)
 	@touch $@

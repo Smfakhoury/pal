@@ -31,6 +31,7 @@ pub struct Ctx<'a> {
     translation_unit: TranslationUnit,
     diagnostics: Diagnostics,
     target_int_widths: TargetIntWidths,
+    symbols: crate::pass::linkage::UnitSymbols,
 }
 
 impl<'a> Ctx<'a> {
@@ -54,6 +55,7 @@ impl<'a> Ctx<'a> {
             },
             diagnostics: Diagnostics::empty(),
             target_int_widths: TargetIntWidths::default(),
+            symbols: crate::pass::linkage::UnitSymbols::default(),
         }
     }
 
@@ -81,6 +83,45 @@ impl<'a> Ctx<'a> {
         self.target_int_widths = widths;
     }
 
+    fn set_linkage_context(&mut self, context: &str) {
+        self.symbols.context.push_str(context);
+        self.symbols.context.push('\n');
+    }
+
+    fn add_c_symbol(
+        &mut self,
+        name: &str,
+        kind: u32,
+        signature: &str,
+        internal: bool,
+        definition: bool,
+        inline: bool,
+        loc: Rc<SourceInfo>,
+    ) {
+        self.symbols.symbols.push(crate::pass::linkage::CSymbol {
+            name: Rc::from(name),
+            kind,
+            signature: signature.to_owned(),
+            internal,
+            definition,
+            inline,
+            loc,
+        });
+    }
+
+    fn add_local_static(&mut self, owner: &str, internal: bool, name: &str) {
+        let owner = if internal {
+            format!("{}{owner}", self.symbols.identity.prefix)
+        } else {
+            owner.to_owned()
+        };
+        self.symbols
+            .local_static_names
+            .entry(Rc::from(owner))
+            .or_default()
+            .insert(Rc::from(name));
+    }
+
     fn intern_str(&mut self, s: &str) -> Rc<str> {
         match self.interned_strs.get(s) {
             Some(s) => s.clone(),
@@ -97,6 +138,14 @@ impl<'a> Ctx<'a> {
             val: self.intern_str(name),
             loc: loc,
         })
+    }
+
+    fn mk_symbol_ident(&mut self, name: &str, internal: bool, loc: Rc<SourceInfo>) -> Rc<Ident> {
+        if internal && !self.symbols.identity.prefix.is_empty() {
+            self.mk_ident(&format!("{}{name}", self.symbols.identity.prefix), loc)
+        } else {
+            self.mk_ident(name, loc)
+        }
     }
 
     fn add_fn_decl(&mut self, builder: DeclBuilder) {
@@ -1040,14 +1089,20 @@ pub fn parse_file(
     file_name: &str,
     include_paths: &[String],
     defines: &[String],
+    identity: &crate::pass::linkage::UnitIdentity,
     vfs: &mut dyn VFS,
-) -> (TranslationUnit, Diagnostics) {
+) -> (
+    TranslationUnit,
+    Diagnostics,
+    crate::pass::linkage::UnitSymbols,
+) {
     let mut ctx = Ctx::new(
         file_name.to_string(),
         include_paths.to_vec(),
         defines.to_vec(),
         vfs,
     );
+    ctx.symbols.identity = identity.clone();
     generated::parse_file(&mut ctx);
-    (ctx.translation_unit, ctx.diagnostics)
+    (ctx.translation_unit, ctx.diagnostics, ctx.symbols)
 }

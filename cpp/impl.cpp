@@ -1,4 +1,5 @@
 #include "generated.h"
+#include "clang/AST/RecordLayout.h"
 #include "clang/Driver/Driver.h"
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Lex/MacroArgs.h"
@@ -329,6 +330,11 @@ public:
   // program. See the StmtExpr arm in trRValue.
   Vec<Rc<ir::Stmt>> *hoistTarget = nullptr;
 
+  // Unlike statement-expression hoisting, this target belongs to exactly one
+  // whole call. Never use it for a nested or conditionally evaluated call.
+  const CallExpr *variadicEvaluationCall = nullptr;
+  Vec<Rc<ir::Stmt>> *variadicEvaluationTarget = nullptr;
+
   // Clears hoistTarget for the extent of a conditionally-evaluated operand.
   struct NoHoist {
     Vec<Rc<ir::Stmt>> **slot;
@@ -385,6 +391,86 @@ public:
     ctx.set_target_int_widths(
         TargetIntWidths(TI.getCharWidth(), TI.getShortWidth(), TI.getIntWidth(),
                         TI.getLongWidth(), TI.getLongLongWidth()));
+    ctx.set_linkage_context(toStr(StringRef(TI.getDataLayoutString())));
+  }
+
+  void collectLinkage(DeclContext *dc) {
+    for (auto *d : dc->decls()) {
+      if (d->isInvalidDecl())
+        continue;
+      auto *function = dyn_cast<FunctionDecl>(d);
+      auto *object = dyn_cast<VarDecl>(d);
+      if ((function || object) && isLinkerAlias(d) &&
+          (astCtx->getSourceManager().isWrittenInMainFile(
+               astCtx->getSourceManager().getExpansionLoc(d->getLocation())) ||
+           (function && function->doesThisDeclarationHaveABody()) ||
+           (object && object->isThisDeclarationADefinition() !=
+                          VarDecl::DeclarationOnly)))
+        ctx.report_diag(getRange(d->getSourceRange()), true,
+                        "unsupported linker symbol alias"_rs);
+      if (auto *fd = dyn_cast<FunctionDecl>(d)) {
+        // These annotated anchors become Pulse/type declarations, not C
+        // functions. Their actual emitted identities are validated in the IR.
+        bool anchor = false;
+        for (auto *attr : fd->specific_attrs<AnnotateAttr>()) {
+          auto name = attr->getAnnotation();
+          anchor |= name == "pal-type" || name == "pal-includes" ||
+                    name == "pal-let" || name == "pal-let-rec" ||
+                    name == "pal-letimpure";
+        }
+        if (anchor)
+          continue;
+        ctx.add_c_symbol(toStr(fd->getName()), 0,
+                         toStr(fd->getType().getCanonicalType().getAsString()),
+                         !fd->hasExternalFormalLinkage(),
+                         fd->doesThisDeclarationHaveABody(), fd->isInlined(),
+                         getRange(fd->getSourceRange()));
+      } else if (auto *vd = dyn_cast<VarDecl>(d); vd && vd->isFileVarDecl()) {
+        ctx.add_c_symbol(toStr(vd->getName()), 1,
+                         toStr(vd->getType().getCanonicalType().getAsString()),
+                         !vd->hasExternalFormalLinkage(),
+                         vd->isThisDeclarationADefinition() !=
+                             VarDecl::DeclarationOnly,
+                         false, getRange(vd->getSourceRange()));
+      } else if (auto *rd = dyn_cast<RecordDecl>(d);
+                 rd && rd->isCompleteDefinition()) {
+        if (rd->getIdentifier()) {
+          const auto &layout = astCtx->getASTRecordLayout(rd);
+          std::string signature =
+              std::to_string(layout.getSize().getQuantity()) + ":" +
+              std::to_string(layout.getAlignment().getQuantity());
+          for (auto *field : rd->fields()) {
+            signature +=
+                "|" + fieldNameStr(field) + ":" +
+                field->getType().getCanonicalType().getAsString() + ":" +
+                std::to_string(layout.getFieldOffset(field->getFieldIndex()));
+            if (field->isBitField())
+              signature += ":" + std::to_string(field->getBitWidthValue());
+          }
+          ctx.add_c_symbol(toStr(rd->getName()), rd->isUnion() ? 3 : 2,
+                           toStr(signature), false, false, false,
+                           getRange(rd->getSourceRange()));
+        }
+        collectLinkage(rd);
+      } else if (auto *td = dyn_cast<TypedefNameDecl>(d)) {
+        ctx.add_c_symbol(
+            toStr(td->getName()), 4,
+            toStr(td->getUnderlyingType().getCanonicalType().getAsString()),
+            false, false, false, getRange(td->getSourceRange()));
+      } else if (auto *ed = dyn_cast<EnumDecl>(d)) {
+        for (auto *constant : ed->enumerators()) {
+          SmallString<32> value;
+          constant->getInitVal().toString(value, 10);
+          ctx.add_c_symbol(toStr(constant->getName()), 5,
+                           toStr(StringRef(value)), false, false, false,
+                           getRange(constant->getSourceRange()));
+        }
+      }
+    }
+  }
+
+  void HandleTranslationUnit(ASTContext &Context) override {
+    collectLinkage(Context.getTranslationUnitDecl());
   }
 
   virtual bool HandleTopLevelDecl(DeclGroupRef DG) override {
@@ -396,7 +482,28 @@ public:
   Rc<ir::Ident> getDeclName(NamedDecl *d) {
     auto loc = mk_fallback_sourceinfo(
         getRange(d->getSourceRange())); // TODO: get range of name token
-    return ctx.mk_ident(toStr(d->getName()), std::move(loc));
+    return symbolIdent(d, std::move(loc), false);
+  }
+
+  bool isLinkerAlias(const Decl *d) {
+    return d->hasAttr<AsmLabelAttr>() || d->hasAttr<AliasAttr>() ||
+           d->hasAttr<IFuncAttr>() || d->hasAttr<WeakRefAttr>();
+  }
+
+  Rc<ir::Ident> symbolIdent(NamedDecl *d, Rc<ir::SourceInfo> loc,
+                            bool reference = true) {
+    if (reference && isLinkerAlias(d))
+      ctx.report_diag(loc.clone(), true, "unsupported linker symbol alias"_rs);
+    bool internal = isa<FunctionDecl>(d) && !d->hasExternalFormalLinkage();
+    if (auto *vd = dyn_cast<VarDecl>(d)) {
+      if (vd->isStaticLocal()) {
+        auto name = staticLocalNames.find(vd);
+        if (name != staticLocalNames.end())
+          return ctx.mk_symbol_ident(toStr(name->second), true, std::move(loc));
+      }
+      internal = vd->hasGlobalStorage() && !vd->hasExternalFormalLinkage();
+    }
+    return ctx.mk_symbol_ident(toStr(d->getName()), internal, std::move(loc));
   }
 
   // Name to use for a struct/union field. Unnamed fields (e.g. C11 anonymous
@@ -894,7 +1001,7 @@ public:
     if (auto generic = dyn_cast<GenericSelectionExpr>(e)) {
       return trLValue(generic->getResultExpr());
     } else if (auto dre = dyn_cast<DeclRefExpr>(e)) {
-      auto id = ctx.mk_ident(toStr(dre->getDecl()->getName()), loc.clone());
+      auto id = symbolIdent(dre->getDecl(), loc.clone());
       return mk_lvalue_var(std::move(loc), std::move(id));
     } else if (auto p = dyn_cast<ParenExpr>(e)) {
       return trLValue(p->getSubExpr());
@@ -1203,6 +1310,262 @@ public:
     return isInertVariadicOperand(e);
   }
 
+  static StringLiteral *predefinedFunctionName(Expr *e) {
+    auto *name = dyn_cast<PredefinedExpr>(e->IgnoreParenImpCasts());
+    return name ? name->getFunctionName() : nullptr;
+  }
+
+  std::unordered_set<const FunctionDecl *> checkingReadOnlyFunctions;
+  std::unordered_map<const VarDecl *, std::string> staticLocalNames;
+  std::unordered_set<const VarDecl *> emittedLocalStatics;
+
+  void collectLocalStatics(FunctionDecl *owner, Stmt *s, unsigned &ordinal) {
+    if (!s)
+      return;
+    if (auto *ds = dyn_cast<DeclStmt>(s)) {
+      for (auto *d : ds->decls()) {
+        if (auto *vd = dyn_cast<VarDecl>(d); vd && vd->hasExternalStorage()) {
+          ctx.add_c_symbol(
+              toStr(vd->getName()), 1,
+              toStr(vd->getType().getCanonicalType().getAsString()),
+              !vd->hasExternalFormalLinkage(), false, false,
+              getRange(vd->getSourceRange()));
+        }
+        if (auto *vd = dyn_cast<VarDecl>(d); vd && vd->isStaticLocal()) {
+          auto function = owner->getNameAsString();
+          staticLocalNames.try_emplace(
+              vd, "__pal_static_" + std::to_string(function.size()) + "_" +
+                      function + "_" + std::to_string(ordinal++) + "_" +
+                      vd->getNameAsString());
+          ctx.add_local_static(toStr(owner->getName()),
+                               !owner->hasExternalFormalLinkage(),
+                               toStr(vd->getName()));
+        }
+      }
+    }
+    for (auto *child : s->children())
+      collectLocalStatics(owner, child, ordinal);
+  }
+
+  bool readOnlyReturningBody(Stmt *s) {
+    if (auto *r = dyn_cast<ReturnStmt>(s))
+      return r->getRetValue() && canEvaluateVariadicArgument(r->getRetValue());
+    if (auto *i = dyn_cast<IfStmt>(s))
+      return !i->getInit() && !i->getConditionVariable() && i->getElse() &&
+             canEvaluateVariadicArgument(i->getCond()) &&
+             readOnlyReturningBody(i->getThen()) &&
+             readOnlyReturningBody(i->getElse());
+    if (auto *b = dyn_cast<CompoundStmt>(s)) {
+      if (b->size() == 1)
+        return readOnlyReturningBody(*b->body_begin());
+      if (b->size() == 2) {
+        auto *i = dyn_cast<IfStmt>(*b->body_begin());
+        return i && !i->getInit() && !i->getConditionVariable() &&
+               !i->getElse() && canEvaluateVariadicArgument(i->getCond()) &&
+               readOnlyReturningBody(i->getThen()) &&
+               readOnlyReturningBody(*(b->body_begin() + 1));
+      }
+    }
+    return false;
+  }
+
+  bool knownReadOnlyCall(CallExpr *c) {
+    auto *fd = c->getDirectCallee();
+    auto *def = fd ? fd->getDefinition() : nullptr;
+    if (!def || fd->getBuiltinID() || def->isVariadic() ||
+        c->getNumArgs() != def->getNumParams() ||
+        !def->getReturnType()->isScalarType())
+      return false;
+    auto *callee = c->getCallee()->IgnoreParenImpCasts();
+    if (auto *u = dyn_cast<UnaryOperator>(callee);
+        u && u->getOpcode() == UO_AddrOf)
+      callee = u->getSubExpr()->IgnoreParenImpCasts();
+    if (!isa<DeclRefExpr>(callee))
+      return false;
+    for (auto *d : fd->redecls()) {
+      // Array parameter declarators can evaluate VLA bounds on entry or
+      // impose minimum sizes, including in a preceding prototype.
+      for (auto *param : d->parameters())
+        if (param->getOriginalType()->isArrayType() ||
+            param->getOriginalType()->isVariablyModifiedType())
+          return false;
+      if (d->hasAttr<WeakAttr>() || d->hasAttr<WeakRefAttr>() ||
+          d->hasAttr<AliasAttr>() || d->hasAttr<IFuncAttr>() ||
+          d->hasAttr<AsmLabelAttr>() || d->hasAttr<NoReturnAttr>() ||
+          d->hasAttr<C11NoReturnAttr>() || d->hasAttr<ReturnsTwiceAttr>() ||
+          d->hasAttr<NonNullAttr>() || d->hasAttr<ReturnsNonNullAttr>() ||
+          d->hasAttr<AssumeAlignedAttr>())
+        return false;
+      for (auto *attr : d->specific_attrs<AnnotateAttr>())
+        if (attr->getAnnotation() == "pal-memset-zero")
+          return false;
+    }
+    // These calls are lowered as PAL intrinsics rather than their C bodies.
+    // Exclude them: inspecting a definition cannot justify that different IR.
+    auto name = fd->getName();
+    if (name == "malloc" || name == "calloc" || name == "free" ||
+        name == "memset" || name.starts_with("__builtin_") ||
+        name.starts_with("__pal_"))
+      return false;
+    for (auto *arg : c->arguments())
+      if (!canOmitVariadicArgument(arg) && !canEvaluateVariadicArgument(arg))
+        return false;
+    // No recursive cycle may justify itself. Only complete, terminating
+    // return/if-return bodies qualify; annotations are not evidence of purity.
+    if (!checkingReadOnlyFunctions.insert(def).second)
+      return false;
+    bool result = readOnlyReturningBody(def->getBody());
+    checkingReadOnlyFunctions.erase(def);
+    return result;
+  }
+
+  bool supportedAggregateEvaluationType(QualType ty) {
+    if (ty.isVolatileQualified() || ty->isAtomicType())
+      return false;
+    if (ty->isIntegerType() || ty->isPointerType())
+      return true;
+    if (auto *array = astCtx->getAsConstantArrayType(ty))
+      return supportedAggregateEvaluationType(array->getElementType());
+    if (auto *record = ty->getAs<RecordType>()) {
+      auto *definition = record->getDecl()->getDefinition();
+      if (!definition)
+        return false;
+      for (auto *field : definition->fields())
+        if (!supportedAggregateEvaluationType(field->getType()))
+          return false;
+      return true;
+    }
+    return false;
+  }
+
+  // A deliberately small, read-only subset whose normal lowering retains all
+  // memory and arithmetic obligations. HasSideEffects alone is insufficient:
+  // comma expressions, for example, currently discard their left operand.
+  bool canEvaluateVariadicArgument(Expr *e) {
+    if (e->getType().isVolatileQualified() || e->getType()->isAtomicType())
+      return false;
+    e = e->IgnoreParens();
+    if (auto *c = dyn_cast<CastExpr>(e)) {
+      switch (c->getCastKind()) {
+      case CK_NoOp:
+      case CK_LValueToRValue:
+      case CK_IntegralCast:
+      case CK_IntegralToBoolean:
+      case CK_PointerToBoolean:
+      case CK_ArrayToPointerDecay:
+      case CK_NullToPointer:
+        return canEvaluateVariadicArgument(c->getSubExpr());
+      case CK_BitCast:
+        return c->getType()->isPointerType() && !c->HasSideEffects(*astCtx) &&
+               c->getSubExpr()->isNullPointerConstant(
+                   *astCtx, Expr::NPC_ValueDependentIsNotNull) &&
+               canEvaluateVariadicArgument(c->getSubExpr());
+      default:
+        return false;
+      }
+    }
+    if (auto *literal = dyn_cast<CompoundLiteralExpr>(e))
+      return supportedAggregateEvaluationType(e->getType()) &&
+             canEvaluateVariadicArgument(literal->getInitializer());
+    if (auto *init = dyn_cast<InitListExpr>(e)) {
+      if (!supportedAggregateEvaluationType(init->getType()))
+        return false;
+      for (auto *value : init->inits())
+        if (value && !canEvaluateVariadicArgument(value))
+          return false;
+      return !init->hasArrayFiller() ||
+             canEvaluateVariadicArgument(init->getArrayFiller());
+    }
+    if (isa<ImplicitValueInitExpr>(e))
+      return supportedAggregateEvaluationType(e->getType());
+    if (auto *literal = dyn_cast<StringLiteral>(e))
+      return literal->getKind() == StringLiteralKind::Ordinary &&
+             literal->getCharByteWidth() == 1;
+    if (isa<IntegerLiteral, CharacterLiteral>(e))
+      return true;
+    if (auto *name = predefinedFunctionName(e))
+      return name->getKind() == StringLiteralKind::Ordinary &&
+             name->getCharByteWidth() == 1;
+    if (auto *c = dyn_cast<CallExpr>(e))
+      return knownReadOnlyCall(c);
+    if (auto *c = dyn_cast<ConditionalOperator>(e))
+      return canEvaluateVariadicArgument(c->getCond()) &&
+             canEvaluateVariadicArgument(c->getTrueExpr()) &&
+             canEvaluateVariadicArgument(c->getFalseExpr());
+    if (auto *ref = dyn_cast<DeclRefExpr>(e))
+      return isa<VarDecl, EnumConstantDecl>(ref->getDecl());
+    if (auto *m = dyn_cast<MemberExpr>(e))
+      return canEvaluateVariadicArgument(m->getBase());
+    if (auto *a = dyn_cast<ArraySubscriptExpr>(e))
+      return canEvaluateVariadicArgument(a->getBase()) &&
+             canEvaluateVariadicArgument(a->getIdx());
+    if (auto *u = dyn_cast<UnaryOperator>(e)) {
+      switch (u->getOpcode()) {
+      case UO_Deref:
+      case UO_AddrOf:
+        return canEvaluateVariadicArgument(u->getSubExpr());
+      case UO_LNot:
+        return (u->getSubExpr()->getType()->isIntegerType() ||
+                u->getSubExpr()->getType()->isPointerType()) &&
+               canEvaluateVariadicArgument(u->getSubExpr());
+      case UO_Plus:
+      case UO_Minus:
+      case UO_Not:
+        return u->getSubExpr()->getType()->isIntegerType() &&
+               canEvaluateVariadicArgument(u->getSubExpr());
+      default:
+        return false;
+      }
+    }
+    if (auto *b = dyn_cast<BinaryOperator>(e)) {
+      if ((b->getOpcode() == BO_EQ || b->getOpcode() == BO_NE) &&
+          b->getLHS()->getType()->isPointerType() &&
+          b->getRHS()->getType()->isPointerType())
+        return canEvaluateVariadicArgument(b->getLHS()) &&
+               canEvaluateVariadicArgument(b->getRHS());
+      if (!b->getLHS()->getType()->isIntegerType() ||
+          !b->getRHS()->getType()->isIntegerType())
+        return false;
+      switch (b->getOpcode()) {
+      case BO_Add:
+      case BO_Sub:
+      case BO_Mul:
+      case BO_Div:
+      case BO_Rem:
+      case BO_And:
+      case BO_Or:
+      case BO_Xor:
+      case BO_LT:
+      case BO_LE:
+      case BO_GT:
+      case BO_GE:
+      case BO_EQ:
+      case BO_NE:
+        return canEvaluateVariadicArgument(b->getLHS()) &&
+               canEvaluateVariadicArgument(b->getRHS());
+      case BO_Shl:
+      case BO_Shr:
+        // Do not narrow the shift count before checking it: a wide invalid
+        // count could otherwise wrap to a valid one. Keep signed shifts out
+        // of this subset as well.
+        return b->getType()->isUnsignedIntegerType() &&
+               astCtx->getTypeSize(b->getRHS()->getType()) <=
+                   astCtx->getTypeSize(b->getLHS()->getType()) &&
+               canEvaluateVariadicArgument(b->getLHS()) &&
+               canEvaluateVariadicArgument(b->getRHS());
+      default:
+        return false;
+      }
+    }
+    if (auto *s = dyn_cast<UnaryExprOrTypeTraitExpr>(e)) {
+      auto ty = s->getTypeOfArgument();
+      return (s->getKind() == UETT_SizeOf || s->getKind() == UETT_AlignOf) &&
+             !ty->isIncompleteType() && !ty->isDependentType() &&
+             !ty->isVariablyModifiedType();
+    }
+    return false;
+  }
+
   // A bitcast from a pointer to a non-byte object type to a byte pointer:
   // the `(uint8_t *)p` of `(uint8_t *)p + n`.
   bool isByteViewCast(const Expr *e) {
@@ -1302,6 +1665,13 @@ public:
   Rc<ir::Expr> trRValue(Expr *e) {
     auto loc = getRange(e->getSourceRange());
 
+    // Clang stores the exact compiler-provided spelling, including GNU's
+    // function-name variants, as a string literal. Reuse its static-array
+    // lowering rather than inventing an identifier or dropping the bytes.
+    if (auto *name = dyn_cast<PredefinedExpr>(e);
+        name && name->getFunctionName())
+      return trRValue(name->getFunctionName());
+
     if (auto generic = dyn_cast<GenericSelectionExpr>(e)) {
       return trRValue(generic->getResultExpr());
     }
@@ -1325,6 +1695,7 @@ public:
       case CK_ArrayToPointerDecay: {
         auto *subExpr = ic->getSubExpr()->IgnoreParenImpCasts();
         if (dyn_cast<StringLiteral>(subExpr) ||
+            predefinedFunctionName(subExpr) ||
             dyn_cast<CompoundLiteralExpr>(subExpr)) {
           return trRValue(ic->getSubExpr());
         }
@@ -1780,7 +2151,7 @@ public:
         if (auto *dre = dyn_cast<DeclRefExpr>(
                 uo->getSubExpr()->IgnoreParenImpCasts())) {
           if (auto *fd = dyn_cast<FunctionDecl>(dre->getDecl())) {
-            auto id = ctx.mk_ident(toStr(fd->getName()), loc.clone());
+            auto id = symbolIdent(fd, loc.clone());
             return mk_rvalue_fnref(std::move(loc), std::move(id));
           }
         }
@@ -2237,22 +2608,78 @@ public:
                                  trQualType(c->getType(), c->getSourceRange()));
           }
         }
-        auto fn = ctx.mk_ident(toStr(fd->getName()),
-                               getRange(c->getCallee()->getSourceRange()));
+        auto fn = symbolIdent(fd, getRange(c->getCallee()->getSourceRange()));
         auto args = Vec<Rc<ir::Expr>>::new_();
-        for (unsigned i = 0; i < c->getNumArgs(); ++i) {
-          auto *arg = c->getArg(i);
-          if (fd->isVariadic() && i >= fd->getNumParams()) {
-            if (!canOmitVariadicArgument(arg)) {
+        bool evaluateTail = false;
+        if (fd->isVariadic()) {
+          for (unsigned i = fd->getNumParams(); i < c->getNumArgs(); ++i)
+            evaluateTail |= !canOmitVariadicArgument(c->getArg(i));
+        }
+        if (evaluateTail) {
+          // Read-only fixed arguments commute with the read-only tail, even
+          // when they alias. Known accessor calls are also read-only by
+          // whole-definition inspection. Normal lowering retains all calls,
+          // reads, values and UB checks; nothing writes before the callee.
+          // Do not turn f(i++, *p) or f(write(p), *p) into a deterministically
+          // sequenced program.
+          bool fixedReadOnly = true;
+          std::string unsupportedFixed;
+          for (unsigned i = 0; i < fd->getNumParams(); ++i) {
+            bool supported = canOmitVariadicArgument(c->getArg(i)) ||
+                             canEvaluateVariadicArgument(c->getArg(i)) ||
+                             predefinedFunctionName(c->getArg(i));
+            if (!supported && unsupportedFixed.empty())
+              unsupportedFixed = " (callee " + fd->getNameAsString() +
+                                 ", fixed argument " + std::to_string(i + 1) +
+                                 ": " + c->getArg(i)->getStmtClassName() + ")";
+            fixedReadOnly &= supported;
+          }
+          if (variadicEvaluationCall != c || !variadicEvaluationTarget ||
+              !fixedReadOnly) {
+            reportUnsupported(
+                c->getSourceRange(), loc,
+                "unsupported ignored variadic argument: evaluation requires "
+                "a whole statement, return, or local initializer call with "
+                "inert or supported read-only fixed arguments",
+                unsupportedFixed);
+            return mk_rvalue_err(std::move(loc),
+                                 trQualType(c->getType(), c->getSourceRange()));
+          }
+          // Validate the entire tail before emitting any evaluations.
+          for (unsigned i = fd->getNumParams(); i < c->getNumArgs(); ++i) {
+            auto *arg = c->getArg(i);
+            if (!canOmitVariadicArgument(arg) &&
+                !canEvaluateVariadicArgument(arg)) {
               reportUnsupported(
                   arg->getSourceRange(), getRange(arg->getSourceRange()),
-                  "unsupported ignored variadic argument: expected a literal, "
-                  "a non-volatile local value or address, or wrapping "
-                  "integer arithmetic over those",
+                  "unsupported ignored variadic argument: evaluation supports "
+                  "only supported read-only expressions and known read-only "
+                  "definitions, not effects, unknown calls or unsupported "
+                  "bodies",
                   "");
               return mk_rvalue_err(
                   std::move(loc),
                   trQualType(c->getType(), c->getSourceRange()));
+            }
+          }
+        }
+        for (unsigned i = 0; i < c->getNumArgs(); ++i) {
+          auto *arg = c->getArg(i);
+          if (fd->isVariadic() && i >= fd->getNumParams()) {
+            if (!canOmitVariadicArgument(arg)) {
+              auto argLoc = getRange(arg->getSourceRange());
+              auto name =
+                  "__pal_variadic_" + std::to_string(rvalueHoistCounter++);
+              auto id = ctx.mk_ident(toStr(StringRef(name)), argLoc.clone());
+              // Keep a function-name literal as its static array value:
+              // decaying it to the ordinary pointer model loses its bytes.
+              Expr *value = predefinedFunctionName(arg);
+              if (!value)
+                value = arg;
+              variadicEvaluationTarget->push(mk_let_stmt(
+                  argLoc.clone(), std::move(id),
+                  trQualType(value->getType(), arg->getSourceRange()),
+                  trRValue(value)));
             }
             continue;
           }
@@ -2326,7 +2753,7 @@ public:
       // A bare reference to a function (function-to-pointer decay): produce a
       // function reference, identical to `&func`.
       if (auto *fd = dyn_cast<FunctionDecl>(dre->getDecl())) {
-        auto id = ctx.mk_ident(toStr(fd->getName()), loc.clone());
+        auto id = symbolIdent(fd, loc.clone());
         return mk_rvalue_fnref(std::move(loc), std::move(id));
       }
       // Other DeclRefExpr in rvalue context: treat as lvalue read
@@ -2652,6 +3079,17 @@ public:
         hoistAddressedCompoundLiterals(stmts, ce);
       }
     }
+  }
+
+  Rc<ir::Expr> trStatementRValue(Vec<Rc<ir::Stmt>> &stmts, Expr *e) {
+    auto *savedCall = variadicEvaluationCall;
+    auto *savedTarget = variadicEvaluationTarget;
+    variadicEvaluationCall = dyn_cast<CallExpr>(e->IgnoreParenImpCasts());
+    variadicEvaluationTarget = &stmts;
+    auto value = trRValue(e);
+    variadicEvaluationCall = savedCall;
+    variadicEvaluationTarget = savedTarget;
+    return value;
   }
 
   rust::Unit trStmt(Vec<Rc<ir::Stmt>> &stmts, Stmt *stmt) {
@@ -3494,7 +3932,8 @@ public:
       return stmts.push(mk_continue(std::move(loc)));
     } else if (auto *r = dyn_cast<ReturnStmt>(stmt)) {
       if (auto *rv = r->getRetValue()) {
-        return stmts.push(mk_return(std::move(loc), trRValue(rv)));
+        auto value = trStatementRValue(stmts, rv);
+        return stmts.push(mk_return(std::move(loc), std::move(value)));
       } else {
         return stmts.push(mk_return_void(std::move(loc)));
       }
@@ -3530,6 +3969,28 @@ public:
       for (auto d : ds->decls()) {
         auto dloc = getRange(d->getSourceRange());
         if (auto vd = dyn_cast<VarDecl>(d)) {
+          if (vd->hasExternalStorage()) {
+            if (vd->getTLSKind() != VarDecl::TLS_None) {
+              ctx.report_diag(dloc.clone(), true,
+                              "unsupported block-scope extern TLS"_rs);
+              stmts.push(mk_stmt_err(dloc.clone()));
+            } else {
+              HandleDecl(vd);
+            }
+            continue;
+          }
+          if (vd->isStaticLocal()) {
+            if (vd->getTLSKind() != VarDecl::TLS_None || isLinkerAlias(vd) ||
+                !staticLocalNames.count(vd)) {
+              ctx.report_diag(
+                  dloc.clone(), true,
+                  "unsupported local-static storage identity or TLS"_rs);
+              stmts.push(mk_stmt_err(dloc.clone()));
+            } else if (emittedLocalStatics.insert(vd).second) {
+              HandleDecl(vd);
+            }
+            continue;
+          }
           auto id = ctx.mk_ident(toStr(vd->getName()), dloc.clone());
           auto qt = vd->getType();
           if (auto *vat =
@@ -3554,7 +4015,7 @@ public:
               // the assignment.
               auto savedHoist = hoistTarget;
               hoistTarget = &stmts;
-              auto init = trRValue(vd->getInit());
+              auto init = trStatementRValue(stmts, vd->getInit());
               hoistTarget = savedHoist;
               stmts.push(mk_assign(dloc.clone(),
                                    mk_lvalue_var(dloc.clone(), id.clone()),
@@ -3609,7 +4070,8 @@ public:
                                   Vec<Rc<ir::Expr>>::new_()));
         }
       }
-      return stmts.push(mk_call(std::move(loc), trRValue(c)));
+      auto value = trStatementRValue(stmts, c);
+      return stmts.push(mk_call(std::move(loc), std::move(value)));
     } else if (auto *se = dyn_cast<StmtExpr>(stmt)) {
       // _assert(p) expands to ({ __attribute__((annotate("pal-assert",
       // ...))) {} })
@@ -3674,8 +4136,7 @@ public:
       //
       // C code writes this when both arms are calls, which is how some
       // assert() implementations expand.  Each arm is translated in
-      // statement position, so an arm that computes a discarded pure value
-      // drops out on its own.
+      // statement position, retaining reads and arithmetic obligations.
       auto thenStmts = Vec<Rc<ir::Stmt>>::new_();
       trStmt(thenStmts, co->getTrueExpr());
       auto elseStmts = Vec<Rc<ir::Stmt>>::new_();
@@ -3688,23 +4149,21 @@ public:
       return rust::Unit();
     }
 
-    // An expression evaluated for a value that is then discarded, where
-    // computing the value does nothing observable, is a no-op -- so drop it
-    // rather than reporting it unsupported.
-    //
-    // C admits such statements (with a warning), and the GNU statement
-    // expression makes them unavoidable: `({ s1; e; });` in statement
-    // position *always* ends in one, because `e` is the construct's value and
-    // the surrounding statement throws it away.  Without this, the general
-    // statement-position arm above could not translate anything.
-    //
-    // `HasSideEffects` is clang's own answer, and it is conservative: a call,
-    // an assignment, an increment, or a volatile read all count, and any of
-    // them still reaches the diagnostic below.
+    // A discarded value is not a discarded evaluation: reads and arithmetic
+    // still require proofs, even when Clang calls them side-effect-free.
     if (auto *ex = dyn_cast<Expr>(stmt)) {
-      if (!ex->HasSideEffects(*astCtx)) {
-        return rust::Unit();
+      if (auto *cast = dyn_cast<CastExpr>(ex);
+          cast && cast->getCastKind() == CK_ToVoid)
+        return trStmt(stmts, cast->getSubExpr());
+      if (!ex->getType()->isVoidType() && canEvaluateVariadicArgument(ex)) {
+        auto name = "__pal_discard_" + std::to_string(rvalueHoistCounter++);
+        auto id = ctx.mk_ident(toStr(StringRef(name)), loc.clone());
+        return stmts.push(mk_let_stmt(
+            loc.clone(), std::move(id),
+            trQualType(ex->getType(), ex->getSourceRange()), trRValue(ex)));
       }
+      if (canOmitVariadicArgument(ex))
+        return rust::Unit();
     }
 
     reportUnsupported(stmt->getSourceRange(), loc, "unsupported statement ",
@@ -3737,6 +4196,10 @@ public:
 
   rust::Unit HandleDecl(Decl *D) {
     if (auto *FD = dyn_cast<FunctionDecl>(D)) {
+      if (FD->doesThisDeclarationHaveABody()) {
+        unsigned ordinal = 0;
+        collectLocalStatics(FD, FD->getBody(), ordinal);
+      }
       // Include block
       if (FD->getName().starts_with("__pal_include_anchor")) {
         std::optional<unsigned> code;
@@ -4013,7 +4476,7 @@ public:
       return {};
     } else if (auto *VD = dyn_cast<VarDecl>(D)) {
       auto loc = getRange(VD->getSourceRange());
-      auto id = ctx.mk_ident(toStr(VD->getName()), loc.clone());
+      auto id = symbolIdent(VD, loc.clone(), false);
       auto ty = trQualType(VD->getType(), VD->getSourceRange(), nullptr,
                            findFnProtoTypeLoc(VD->getTypeSourceInfo()));
       OptExpr init = VD->hasInit() ? OptExpr::Some(trRValue(VD->getInit()))
@@ -4315,6 +4778,32 @@ static void parse_file(RefMut<Ctx> ctx) {
     compDB = std::make_unique<FixedCompilationDatabase>(".", argsForCompDB);
   }
 
+  const auto commands = compDB->getCompileCommands(fileName);
+  if (commands.size() == 1) {
+    const auto &command = commands.front();
+    std::string context = command.Directory;
+    bool output = false;
+    for (const auto &arg : command.CommandLine) {
+      if (output) {
+        output = false;
+        continue;
+      }
+      if (arg == "-o") {
+        output = true;
+        continue;
+      }
+      if (arg == fileName || arg == command.Filename || arg == "-c")
+        continue;
+      context += "\n" + arg;
+    }
+    ctx.set_linkage_context(toStr(context));
+  } else {
+    ctx.report_diag(
+        mk_original_location(ctx.intern_str(toStr(fileName)), 1, 1, 1, 1), true,
+        "missing or ambiguous compilation commands for selected translation unit"_rs);
+    return;
+  }
+
   ClangTool Tool(*compDB, sourcePathList,
                  std::make_shared<PCHContainerOperations>(), CtxVFS::make(ctx));
 
@@ -4329,9 +4818,10 @@ static void parse_file(RefMut<Ctx> ctx) {
   Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(
       {"-DC2PULSE", "-fno-builtin", "-D_FORTIFY_SOURCE=0"},
       ArgumentInsertPosition::BEGIN));
-  Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(
-      {"-Wno-unused-but-set-variable", "-Wno-unused-variable"},
-      ArgumentInsertPosition::END));
+  Tool.appendArgumentsAdjuster(
+      getInsertArgumentAdjuster({"-Wno-unused-but-set-variable",
+                                 "-Wno-unused-variable", "-Wno-unused-value"},
+                                ArgumentInsertPosition::END));
   Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(
       {"-resource-dir", getResourcesPath()}, ArgumentInsertPosition::BEGIN));
 
@@ -4360,7 +4850,10 @@ static void parse_file(RefMut<Ctx> ctx) {
   }
 
   PALActionFactory factory(ctx, rangeMap);
-  Tool.run(&factory);
+  if (Tool.run(&factory) != 0)
+    ctx.report_diag(
+        mk_original_location(ctx.intern_str(toStr(fileName)), 1, 1, 1, 1), true,
+        "failed to parse selected translation unit"_rs);
 }
 
 namespace rust::exported_functions {

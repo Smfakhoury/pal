@@ -1,0 +1,4 @@
+variadic_definition_visibility.c:9: unsupported ignored variadic argument
+variadic_definition_visibility.c:12: unsupported ignored variadic argument
+variadic_definition_visibility.c:15: unsupported ignored variadic argument
+variadic_definition_visibility.c:29: unsupported ignored variadic argument

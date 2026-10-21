@@ -350,10 +350,10 @@ pub enum ExprT {
     /// the function the pointer currently holds.
     FnPtrCall(Rc<Expr>, Exprs),
     Cast(Rc<Expr>, Rc<Type>),
-    /// `_container_of(ptr, struct T, field)` — recover a `ref` to the enclosing
-    /// struct `T` from a `ref` to its `field` (the CONTAINING_RECORD / offsetof
-    /// idiom). Holds the field pointer, the enclosing struct type, and the field
-    /// name. Emitted as the generated `struct_T__field_container ptr`.
+    /// `_container_of(ptr, T, field)` — recover a `ref` to the enclosing
+    /// struct or union `T` from its field address (the CONTAINING_RECORD /
+    /// offsetof idiom). Holds the field pointer, enclosing type, and field
+    /// name. Emitted as the generated per-field container function.
     ContainerOf(Rc<Expr>, Rc<Type>, Rc<Ident>),
     InlinePulse(Rc<InlinePulseCode>, Rc<Type>),
     Live(Rc<Expr>),

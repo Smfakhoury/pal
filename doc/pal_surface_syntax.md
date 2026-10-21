@@ -22,21 +22,196 @@ the variadic arguments. The generated function and its calls contain only
 the fixed parameters; extra arguments do not transfer ownership to the
 callee.
 
-For this initial support, ignored arguments must be literals (including
+Ignored arguments can be omitted when they are literals (including
 string literals), integer constant expressions, non-volatile/non-atomic scalar
 or pointer local/parameter values, addresses of ordinary local variables or
 parameters (including a local array, which decays to its address), or
 computations over those that cannot be undefined: integer conversions, `~`,
 `&`, `|`, `^`, unsigned `+`, `-` and `*`, and unsigned shifts by a constant
 smaller than the width. Parentheses and implicit value conversions (including
-default promotions) are allowed. Dereferences, member/subscript reads,
-division, signed arithmetic, side effects, and other unsupported extra
-expressions are rejected rather than silently skipping their evaluation.
+default promotions) are allowed.
+
+For a call occupying an entire expression statement, return value, or local
+variable initializer, PAL also evaluates a restricted read-only tail before
+the call, binding each non-inert extra argument once to a fresh local and
+discarding only its value. Non-volatile/non-atomic dereferences, member and
+subscript reads, integer arithmetic (including division and signed arithmetic),
+unsigned shifts, and integer conversions retain their ordinary ownership, bounds
+and arithmetic proof obligations. Shift counts must have no wider integer type
+than the promoted left operand, avoiding narrowing before the count check.
+Fixed arguments must be inert as described above or belong to the same supported
+read-only subset. They stay in the call's argument list and retain their values,
+reads and arithmetic obligations. Fixed and tail evaluations commute even when
+they read aliased memory: neither writes nor accesses volatile or atomic objects,
+and all evaluations precede the variadic callee. Evaluating the tail first
+therefore cannot change the fixed values or the call's result.
+
+Read-only `?:` operands are supported, including `p == 0 ? 0 : *p` and guarded
+accessor calls. Only the selected arm executes; nullable ownership is opened
+and restored inside its branch. Both arms must belong to the supported subset.
+Ordinary integer/pointer aggregates, nested constant arrays, compound literals,
+and implicit zero initialization are supported when every initializer belongs
+to this subset. Volatile/atomic members and effectful or unknown initializer
+calls remain rejected. Pointer bitcasts of genuine null pointer constants,
+including `(struct T *)((void *)0)`, are supported; arbitrary pointer bitcasts
+are not justified by this rule. Post-call nullable ownership cleanup occurs
+before a caller returns: the returned expression is evaluated once into a
+temporary, cleanup runs, and the saved value is returned.
+
+Direct non-variadic accessor calls are supported only when a complete definition
+is visible and passes whole-body syntactic inspection. Accepted bodies consist
+of a return, an if/else with returning branches, or an if-return followed by a
+return; return expressions and call arguments must recursively be read-only.
+Calls remain in the IR, so F* must verify their contracts and their definitions.
+Function names and `pure`/`const` claims do not establish read-only behavior.
+Unknown or indirect calls, recursion, local declarations, loops, writes,
+volatile/atomic accesses, intrinsic overrides and unsupported bodies are rejected.
+Array parameter declarators and variably modified parameter types are rejected:
+their entry-time bound evaluations or implicit minimum-size requirements cannot
+be justified by inspecting a return body alone.
+Supported examples include accessors returning field addresses and helpers selecting a
+pointer or a static object's address; no target bodies or values are inferred.
+
+Definition visibility is currently per Clang translation unit and declaration
+order: the body must already be parsed at the call site. Adding another source
+file to the same PAL command or compilation database does not make its body
+available to this classifier. PAL combines the resulting IR only after these
+checks. Aggregate-returning accessor calls remain outside the subset.
+`test/variadic_definition_visibility/` pins these conservative boundaries,
+including a definition parsed in an earlier input file and a later definition
+within the same file. Supporting cross-unit classification requires shared,
+definition-backed analysis and verification, not declaration-only purity claims.
+`test/variadic_aggregate_values/` verifies aggregate and null evaluation and
+requires missing ownership and unchecked overflow to fail.
+`test/variadic_aggregate_effects/` rejects mutation, unknown initializer calls,
+and volatile members.
+
+Multi-file translation preserves each input translation unit's private functions
+and file-scope objects through AST references, specifications, dependency pruning,
+merging, and emission. Their emitted names have a `__pal_tu_<hash>_` prefix derived
+from the owning input's canonical path relative to the common selected-source
+ancestor, not an absolute checkout root, input position, file contents, or the
+header containing the declaration. Relocating the same relative source tree or
+reversing the inputs preserves proof-module names and bytes. Changing the selected
+source set or relative layout can change identities. A shared header's statics
+remain independent instances, as do identical input files. Hash collisions,
+duplicate selected aliases, and unestablished canonical identities are rejected.
+External names and single-file private names remain unchanged.
+
+Before pruning, PAL compares selected units' canonical C declarations, record
+layouts, compilation-command contexts and target layouts. Conflicting external
+definitions, incompatible declarations, and differing translated type/Pulse/object
+representations produce errors rather than an input-order-dependent choice.
+Equal inline definitions from the same original source range may merge; all other
+multiple external definitions are rejected. Compatible prototypes, parameter-name
+differences, existing object `_pure`/`_opaque_to_smt` annotation merging, and simple
+incomplete/complete external array declarations retain their existing meaning.
+Compatible external objects select an original type representation deterministically,
+preferring complete arrays and definitions before breaking ties by logical TU path.
+Typedef and pointer-view semantics are retained, not erased to force compatibility.
+Repeated typedef definitions may differ only by transparent alias spelling.
+PAL compares their bodies after expanding non-pointer-view aliases, retaining
+pointer kinds, refinements and view boundaries; conflicting representations still
+produce errors. Equivalent declarations deterministically retain one original
+spelling in the emitted modules. `test/linkage_typedef_alias/` proves both original
+accessor bodies across input order and relocation; `test/linkage_typedef_view_conflict/`
+rejects conflicting pointer views, including aliases hiding those conflicts.
+Compilation contexts are compared conservatively, so even harmless differences
+can require identical selected commands. Missing/ambiguous commands and linker
+aliases are rejected explicitly.
+
+Block-scope static objects use persistent global storage, not automatic locals or
+per-call initialization. Their internal identities combine the owning TU,
+function and lexical declaration ordinal; separate blocks and same-named
+functions in other TUs remain distinct. Initializers, address identity, zero
+initialization and mutable storage use the existing global-object model. A
+block-scope `extern` declaration denotes the external object (or the preceding
+internal-linkage object), not fresh stack storage. These declarations participate
+in linkage/type/context checks. Mutable static storage still needs ownership:
+lowering its declaration grants no permission to read or write it.
+
+TLS and linker aliases remain unsupported. Since annotation antiquotations do
+not retain Clang's block scopes, an unqualified annotation name overlapping an
+owning function's local-static name is rejected rather than silently resolving
+to an unrelated global. `__pal_static_` is reserved alongside `__pal_tu_`.
+`test/local_static_identity/` checks native repeat-call state, persistent
+addresses, separate scopes/TUs, original-body proofs, deliberately false
+contracts and byte-equivalent relocation. `test/local_static_rejected/` covers
+TLS, reserved names and ambiguous annotation bindings.
+
+C antiquotations in annotations resolve TU-private names with parameter, ghost,
+quantifier and local binding tracking. Because the current IR flattens bare C
+blocks, antiquotations referring to a private name after a same-named local
+declaration are conservatively rejected. Raw `Func_`, `Funcptr_` or `Global_`
+references to unqualified private modules are also rejected in multi-file mode;
+use supported C antiquotations instead. Ordinary C references are qualified while
+Clang still knows the actual binding, including references after a shadowing block.
+
+`test/linkage_identity/` checks native 1/2 results, both original implementations,
+private objects, shared-header statics, genuine contracts, and four deliberately
+false contracts in both input orders. The false contracts must fail for their
+actual value property. `test/linkage_identical/` additionally checks identical
+source contents, same basenames in different directories, canonical aliases, and
+fresh-root module-byte equivalence. `test/linkage_conflict/`, `test/linkage_context/`,
+and `test/linkage_annotations/` cover restrictive controls. The combined candidate's
+unchanged-original counterexamples and relocation results are recorded under
+`evidence/fixed/`; `evidence/baseline/pal` is the immutable v4 binary, not a published
+build of this candidate. Absolute diagnostic/source-range paths remain provenance.
+
+This linkage prerequisite does **not** implement a cross-TU read-only registry,
+make later function definitions visible to argument classification, or extend
+the supported expression/body subset.
+
+This lowering does not infer stronger contracts or repair general Pulse
+ownership joins. For example, a conditional fixed operand calling a pointer
+accessor can retain its evaluation yet lose the accessor's returned-value
+relationship at the branch join; a caller postcondition requiring that
+relationship can still fail verification. Direct conditional reads and
+conditional scalar-identity calls have separate positive value checks.
+
+This is not general variadic-expression support: a variadic call requiring tail
+evaluation cannot itself occur in a nested call, assignment expression, `?:`
+arm, or short-circuit operand.
+An ordinary `if` statement can contain a supported whole call; its evaluations
+stay inside that branch. Writes, increments, comma expressions, logical
+short-circuit expressions, and signed shifts in evaluated arguments remain
+outside the subset. The inert-argument omission rules are unchanged.
+Unsupported shapes are diagnosed rather than silently dropping evaluations or
+hoisting them across other operands.
 Indirect variadic calls and variadic argument extraction are not supported.
 
 For example, `read_first(int *first, ...)` may return `*first`, and a caller
 may use `read_first(&a, &b, &c)`. Only `&a` is passed in the generated Pulse
-call. See `test/variadic_call/variadic_call.c`.
+call. See `test/variadic_call/variadic_call.c` and `test/variadic_evaluate/`.
+`test/variadic_evaluate_fail/` checks that missing ownership, unchecked arithmetic,
+and an incorrect result postcondition still fail verification;
+`test/variadic_evaluate_reject/` checks unsupported expression shapes.
+These fixtures also cover fixed dereference/member/array reads, aliased
+fixed/tail reads before a callee write, branch-local ownership, missing fixed
+ownership, fixed-argument arithmetic failures, and unsequenced effects.
+`test/variadic_readonly_calls/` covers nullable and arithmetic guards, nested
+accessors, field/static addresses, call preconditions and incorrect contracts.
+
+Compiler-provided function-name expressions such as `__func__`, `__FUNCTION__`,
+and `__PRETTY_FUNCTION__` use Clang's exact static string (including its trailing
+NUL) through the normal string-literal lowering. They may be fixed arguments of
+calls with evaluated tails; in an evaluated tail the static string is retained
+in a local binding. See `test/predefined_name/` for byte-for-byte positive and
+negative verification controls. This uses the existing string-literal model:
+`_array` parameters expose contents, while ordinary pointer parameters do not
+gain ownership or content facts. Existing array-literal argument materialization
+limitations (notably calls directly in returns) are unchanged.
+
+## Discarded expression statements
+
+A legal statement such as `status;`, `*p;`, or `(void)*p;` discards its value,
+not its evaluation. Supported read-only nonvoid expressions are evaluated into
+fresh local bindings, retaining ownership and arithmetic proof obligations.
+Unsupported shapes are diagnosed rather than erased based on Clang's
+`HasSideEffects` result. PAL suppresses the corresponding unused-value warning
+because discarding a value is intentional and independently checked.
+See `test/discarded_value/` for positive cases and missing-ownership, overflow
+and division-by-zero verification failures.
 
 ## Syntax for specifications
 

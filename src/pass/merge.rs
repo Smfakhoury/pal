@@ -315,7 +315,15 @@ pub fn merge(diags: &mut Diagnostics, tu: &mut TranslationUnit) {
                 debug_assert_eq!(earlier_gv.is_enum_constant, later_gv.is_enum_constant);
                 let merged = GlobalVar {
                     name: later_gv.name.clone(),
-                    ty: later_gv.ty.clone(),
+                    ty: if matches!(
+                        later_gv.ty.val,
+                        TypeT::FlexArray(_) | TypeT::Pointer(_, PointerKind::Array)
+                    ) && matches!(earlier_gv.ty.val, TypeT::FixedArray(_, _))
+                    {
+                        earlier_gv.ty.clone()
+                    } else {
+                        later_gv.ty.clone()
+                    },
                     init: later_gv.init.clone().or_else(|| earlier_gv.init.clone()),
                     is_pure: earlier_gv.is_pure || later_gv.is_pure,
                     // The object is external only if *no* file in this build

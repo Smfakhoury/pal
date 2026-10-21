@@ -1,0 +1,3 @@
+unqualified local-static name in annotation is unsupported
+unsupported local-static storage identity or TLS
+reserved translation-unit identity prefix
