@@ -32,6 +32,14 @@ uint32_t run_once(uint32_t x)
     return r;
 }
 
+void invalid_once_invariant(void)
+{
+    do
+        _invariant(0 == 1)
+    {
+    } while (0);
+}
+
 /* do-while with break: search for a threshold */
 uint32_t find_limit(uint32_t n, uint32_t limit)
     _requires(n >= 1 && n <= 100 && limit <= 100)

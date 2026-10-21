@@ -3,4 +3,8 @@ borrowed array-cell arguments may alias at field path X
 borrowed array-cell argument variable `A` also appears in another call argument
 borrowed array-cell argument variable `I` also appears in another call argument
 array-cell pointer argument uses an index with side effects
+requires exactly one borrowed argument
+requires a single increment or decrement of a stable operand
+shares variables with the array expression
+requires side-effect-free remaining arguments
 assignment target overlaps borrowed array-cell argument variable `A`

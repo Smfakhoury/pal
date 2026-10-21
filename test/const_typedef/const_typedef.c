@@ -40,6 +40,21 @@ void call_read_optional()
     read_optional(NULL);
 }
 
+// An *optional* pointer to const. The permission and pointee become
+// signature-level implicits like those of any const parameter, but they sit
+// behind a null guard.
+void read_optional_const(PCINT _nullable p) {}
+
+// A null argument has no hold of its own to solve those implicits against. The
+// ghost steps test/nullable describes for any null argument supply one, so the
+// call elaborates.
+void call_read_optional_const(void)
+{
+    _ghost_stmt(Pulse.Lib.C.Nullable.intro_unless_null_null (null #Int32.t) (Pulse.Lib.Reference.pts_to (null #Int32.t) #1.0R 0l));
+    read_optional_const(NULL);
+    _ghost_stmt(Pulse.Lib.C.Nullable.elim_unless_null_null (null #Int32.t) _);
+}
+
 int call_read_through_typedef()
 {
     int x = 67;

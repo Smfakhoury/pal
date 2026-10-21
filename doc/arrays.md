@@ -56,9 +56,20 @@ For field arguments such as `f(&a[i].x, &a[i].y)`, PAL borrows the cell once and
 uses the ordinary generated struct field accessors on the borrowed ref. To keep
 this sound, all direct borrowed-cell arguments in one call for the same array
 must use the identical index expression, field paths must not alias, the array
-root and index variables must not appear in other arguments, and the index must
-be side-effect-free. If any rule is violated PAL reports a diagnostic and the
-program should use the explicit local-pointer borrow/return form instead.
+root and index variables must not appear in other arguments, and indices of
+multiple borrowed arguments must be side-effect-free. If any rule is violated
+PAL reports a diagnostic and the program should use the explicit local-pointer
+borrow/return form instead.
+
+With a single borrowed argument, prefix/postfix `++` and `--` indices are
+supported, including `f(&a[i++])` and `f(&a[(*i)++].field)`. The update's operand
+and array expression must be side-effect-free, the array and index expressions
+must not share variables, and other arguments must be side-effect-free. Calls
+inside the index and multiple effectful borrowed arguments remain rejected.
+PAL evaluates the array and index once, then reuses those values for the borrow,
+read and return. Bounds, ownership and arithmetic obligations are unchanged.
+Direct calls return the cell automatically; do not add a manual
+`array_return_cell` afterward. Explicit local-pointer borrows still require it.
 
 The same borrow/return lowering applies when such a call is the whole
 right-hand side of an assignment, a local initializer, or a `return`. For

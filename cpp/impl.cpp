@@ -3239,32 +3239,6 @@ public:
                                  std::move(invs), std::move(reqs),
                                  std::move(enss), std::move(bodyStmts)));
     } else if (auto *d = dyn_cast<DoStmt>(stmt)) {
-      // `do { body } while (0)` is not a loop, it is the C idiom for giving a
-      // macro a single-statement body, and encoding it as one costs more than
-      // the two flags it introduces: a loop's postcondition is its invariant,
-      // so every fact the body established -- including that it cannot be
-      // reached at all, which is exactly what an aborting macro says -- is lost
-      // at the loop's exit. The body runs once and falls out, so emit it.
-      //
-      // Only when nothing in the body jumps out of it: a `break` or `continue`
-      // that binds to the do-while has no meaning once the loop is gone.
-      {
-        if (isSideEffectFreeZero(*astCtx, d->getCond()) &&
-            !hasTopLevelContinue(d->getBody()) &&
-            !hasTopLevelBreak(d->getBody())) {
-          auto *doBody = d->getBody();
-          if (auto attrBody = dyn_cast<AttributedStmt>(doBody))
-            doBody = attrBody->getSubStmt();
-          if (auto *compound = dyn_cast<CompoundStmt>(doBody)) {
-            for (auto *child : compound->body())
-              trStmt(stmts, child);
-          } else {
-            trStmt(stmts, doBody);
-          }
-          return {};
-        }
-      }
-
       // Desugar `do { body } while (cond)` into a `while` loop. There are two
       // desugarings, and the presence of a *top-level* `continue` in the body
       // selects between them:
@@ -3307,14 +3281,21 @@ public:
       auto enss = Vec<Rc<ir::Expr>>::new_();
       std::string flagName;
       std::string condName;
+      // Whether the user wrote any loop annotation on this do-while. The Vec
+      // bridge exposes only new_/push, so emptiness is tracked here rather
+      // than queried afterwards.
+      bool sawLoopAnnot = false;
       if (auto attrBody = dyn_cast<AttributedStmt>(body)) {
         for (auto attr : attrBody->getAttrs()) {
           if (auto inv = isUnaryAttrOf(attr, "pal-invariant")) {
             invs.push(std::move(inv.value()));
+            sawLoopAnnot = true;
           } else if (auto req = isUnaryAttrOf(attr, "pal-requires")) {
             reqs.push(std::move(req.value()));
+            sawLoopAnnot = true;
           } else if (auto ens = isUnaryAttrOf(attr, "pal-ensures")) {
             enss.push(std::move(ens.value()));
+            sawLoopAnnot = true;
           } else if (auto ann = dyn_cast<AnnotateAttr>(attr)) {
             if (ann->getAnnotation() == "pal-do-while-first" &&
                 ann->args_size() == 1) {
@@ -3332,6 +3313,40 @@ public:
           }
         }
         body = attrBody->getSubStmt();
+      }
+
+      // `do { ... } while (0)` is not a loop. It is C's standard idiom for
+      // giving a multi-statement macro a single-statement body (C FAQ 10.4),
+      // and BUG_ON and assert-style macros are built from it.
+      //
+      // Desugaring it like any other do-while is semantically correct but
+      // destroys the facts it establishes: the body becomes a Pulse `while`,
+      // and the *only* thing that survives a loop is its invariant. The
+      // auto-generated invariant relates the two loop-control flags and says
+      // nothing about program state, so
+      //
+      //     BUG_ON(i >= n);   // do { if (i >= n) abort(); } while (0)
+      //
+      // taught the solver nothing about `i` afterwards -- even though
+      // _pal_abort ensures `pure False`, so the `if` really does establish
+      // `i < n` on the path that continues. Every bounds check written this
+      // way was invisible, which for a codebase whose validation idiom *is*
+      // BUG_ON means essentially all of its input validation was invisible.
+      //
+      // When the guard is a constant zero the body runs exactly once, so
+      // emitting it straight-line is not an optimisation but the faithful
+      // translation. Guarded conservatively:
+      //   * a top-level `break` or `continue` in the body targets this
+      //     do-while (both exit it, since the guard is false); inlining would
+      //     silently re-bind them to an enclosing loop, or to nothing;
+      //   * any user annotation means the user is treating this as a loop, so
+      //     honour that and take the general path.
+      {
+        if (isSideEffectFreeZero(*astCtx, d->getCond()) && !sawLoopAnnot &&
+            flagName.empty() && condName.empty() && !hasTopLevelBreak(body) &&
+            !hasTopLevelContinue(body)) {
+          return trStmt(stmts, body);
+        }
       }
 
       // First-iteration flag: named by _do_while_first, else auto-generated.

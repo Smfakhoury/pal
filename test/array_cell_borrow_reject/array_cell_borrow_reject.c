@@ -10,6 +10,7 @@ void UseArray(uint32_t* x, _array Pair* a) { *x = 0; }
 void UseIndex(uint32_t* x, size_t i) { *x = (uint32_t)i; }
 void OutOne(_out uint32_t* x) { *x = 3; }
 uint32_t ReadOne(uint32_t* x) { return *x; }
+size_t NextIndex(void);
 
 void DifferentIndex(_array Pair* A, size_t Count, size_t I, size_t J)
   _requires(A._length == Count)
@@ -47,8 +48,25 @@ void SideEffectIndex(_array Pair* A, size_t Count, size_t I)
   _requires(A._length == Count)
 {
     if (I + 1 < Count) {
-        UseOne(&A[I++].X);
+        UseOne(&A[NextIndex()].X);
     }
+}
+
+void MultipleEffectIndices(_array Pair* A, size_t I)
+{
+    UseTwo(&A[I++].X, &A[I++].Y);
+}
+
+void MixedEffectArguments(_array Pair* A, size_t I)
+{
+    UseIndex(&A[I++].X, NextIndex());
+}
+
+struct Layout { _array Pair *Values; size_t Index; };
+
+void SharedExpressionRoot(struct Layout *s)
+{
+    UseOne(&s->Values[s->Index++].X);
 }
 
 void OutField(_array Pair* A, size_t Count, size_t I)

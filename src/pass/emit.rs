@@ -800,6 +800,8 @@ struct BorrowedArrayCellArg {
 struct BorrowedArrayCellGroup {
     arr: Rc<Expr>,
     idx: Rc<Expr>,
+    arr_tmp: Doc,
+    idx_tmp: Doc,
     cell: Rc<Expr>,
     tmp: Doc,
     needs_read: bool,
@@ -1115,19 +1117,14 @@ impl<'a> Emitter<'a> {
         })
     }
 
-    fn emit_array_cell_read(&mut self, env: &Env, arr_doc: Doc, idx: &Rc<Expr>) -> Doc {
-        naryfn([
-            Doc::text("array_cell_read"),
-            arr_doc,
-            self.emit_rvalue(env, idx),
-        ])
-        .append(";")
-        .nest(2)
-        .group()
+    fn emit_array_cell_read(arr_doc: Doc, idx_doc: Doc) -> Doc {
+        naryfn([Doc::text("array_cell_read"), arr_doc, idx_doc])
+            .append(";")
+            .nest(2)
+            .group()
     }
 
-    fn emit_array_cell_return(&mut self, env: &Env, arr_doc: Doc, idx: &Rc<Expr>) -> Doc {
-        let idx_doc = self.emit_rvalue(env, idx);
+    fn emit_array_cell_return(arr_doc: Doc, idx_doc: Doc) -> Doc {
         let cell_ref = naryfn([
             Doc::text("array_cell_ref"),
             arr_doc.clone(),
@@ -1143,8 +1140,7 @@ impl<'a> Emitter<'a> {
             .group()
     }
 
-    fn emit_array_cell_return_unchanged(&mut self, env: &Env, arr_doc: Doc, idx: &Rc<Expr>) -> Doc {
-        let idx_doc = self.emit_rvalue(env, idx);
+    fn emit_array_cell_return_unchanged(arr_doc: Doc, idx_doc: Doc) -> Doc {
         let cell_ref = naryfn([
             Doc::text("array_cell_ref"),
             arr_doc.clone(),
@@ -1160,6 +1156,17 @@ impl<'a> Emitter<'a> {
             .group()
     }
 
+    fn is_counter_update(expr: &Expr) -> bool {
+        match &expr.val {
+            ExprT::Cast(inner, _) => Self::is_counter_update(inner),
+            ExprT::PreIncr(target)
+            | ExprT::PostIncr(target)
+            | ExprT::PreDecr(target)
+            | ExprT::PostDecr(target) => Self::expr_is_dup_safe(target),
+            _ => false,
+        }
+    }
+
     fn validate_borrowed_array_cell_args(
         &mut self,
         args: &[Rc<Expr>],
@@ -1171,11 +1178,34 @@ impl<'a> Emitter<'a> {
 
         for b in borrowed {
             if !Self::expr_is_dup_safe(&b.idx) {
-                self.report(
-                        "array-cell pointer argument uses an index with side effects; use an explicit local pointer form".to_string(),
+                let mut arr_vars = HashSet::new();
+                let mut idx_vars = HashSet::new();
+                Self::collect_expr_vars(&b.arr, &mut arr_vars);
+                Self::collect_expr_vars(&b.idx, &mut idx_vars);
+                let other_args_are_read_only = args
+                    .iter()
+                    .enumerate()
+                    .all(|(i, arg)| borrowed_indices.contains(&i) || Self::expr_is_dup_safe(arg));
+                let reason = if borrowed.len() != 1 {
+                    Some("requires exactly one borrowed argument")
+                } else if !Self::is_counter_update(&b.idx) {
+                    Some("requires a single increment or decrement of a stable operand")
+                } else if !Self::expr_is_dup_safe(&b.arr) {
+                    Some("requires a side-effect-free array expression")
+                } else if !arr_vars.is_disjoint(&idx_vars) {
+                    Some("shares variables with the array expression")
+                } else if !other_args_are_read_only {
+                    Some("requires side-effect-free remaining arguments")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    self.report(
+                        format!("array-cell pointer argument uses an index with side effects: {reason}; use an explicit local pointer form"),
                         &b.idx.loc,
                     );
-                ok = false;
+                    ok = false;
+                }
             }
         }
 
@@ -1340,6 +1370,8 @@ impl<'a> Emitter<'a> {
                     BorrowedArrayCellGroup {
                         arr: b.arr.clone(),
                         idx: b.idx.clone(),
+                        arr_tmp: self.fresh_tmp("borrow_array"),
+                        idx_tmp: self.fresh_tmp("borrow_idx"),
                         cell: b.cell.clone(),
                         tmp: self.fresh_tmp("borrow"),
                         needs_read: false,
@@ -1356,39 +1388,43 @@ impl<'a> Emitter<'a> {
             }
         }
 
-        // The array a cell is carved out of must be a live handle, so an
-        // intermediate subscript of a multidimensional array borrows its row
-        // (`emit_array_rvalue`). When it does, the cell is read and returned
-        // through that same row handle, and the rows are given back after the
-        // cells, innermost first. Otherwise the array is re-emitted at each
-        // use as before.
+        // Reuse the evaluated array and index even if the call or assignment
+        // changes their source expressions. Return borrowed rows after cells,
+        // innermost first.
         let rows_mark = self.pending_rows.len();
-        let mut live_arrs: HashMap<(String, String), Doc> = HashMap::new();
         let mut prelude = Vec::new();
         for key in &group_order {
             let group = groups.get(key).unwrap();
-            let group_rows_mark = self.pending_rows.len();
             let arr_doc = self.emit_array_rvalue(env, &group.arr);
-            if self.pending_rows.len() > group_rows_mark {
-                live_arrs.insert(key.clone(), arr_doc.clone());
-            }
             let idx_doc = self.emit_rvalue(env, &group.idx);
-            prelude.push(
-                Doc::text("let ")
-                    .append(group.tmp.clone())
-                    .append(Doc::text(" ="))
-                    .append(Doc::line())
-                    .append(naryfn([Doc::text("array_borrow_cell"), arr_doc, idx_doc]))
-                    .append(";")
-                    .nest(2)
-                    .group(),
-            );
+            for (name, value) in [
+                (group.arr_tmp.clone(), arr_doc),
+                (group.idx_tmp.clone(), idx_doc),
+                (
+                    group.tmp.clone(),
+                    naryfn([
+                        Doc::text("array_borrow_cell"),
+                        group.arr_tmp.clone(),
+                        group.idx_tmp.clone(),
+                    ]),
+                ),
+            ] {
+                prelude.push(
+                    Doc::text("let ")
+                        .append(name)
+                        .append(Doc::text(" ="))
+                        .append(Doc::line())
+                        .append(value)
+                        .append(";")
+                        .nest(2)
+                        .group(),
+                );
+            }
             if group.needs_read {
-                let arr_doc = match live_arrs.get(key) {
-                    Some(arr_doc) => arr_doc.clone(),
-                    None => self.emit_rvalue(env, &group.arr),
-                };
-                prelude.push(self.emit_array_cell_read(env, arr_doc, &group.idx));
+                prelude.push(Self::emit_array_cell_read(
+                    group.arr_tmp.clone(),
+                    group.idx_tmp.clone(),
+                ));
             }
         }
 
@@ -1414,14 +1450,16 @@ impl<'a> Emitter<'a> {
         let mut postlude: Vec<Doc> = Vec::new();
         for key in group_order.into_iter().rev() {
             let group = groups.get(&key).unwrap();
-            let arr_doc = match live_arrs.get(&key) {
-                Some(arr_doc) => arr_doc.clone(),
-                None => self.emit_rvalue(env, &group.arr),
-            };
             if group.writable {
-                postlude.push(self.emit_array_cell_return(env, arr_doc, &group.idx));
+                postlude.push(Self::emit_array_cell_return(
+                    group.arr_tmp.clone(),
+                    group.idx_tmp.clone(),
+                ));
             } else {
-                postlude.push(self.emit_array_cell_return_unchanged(env, arr_doc, &group.idx));
+                postlude.push(Self::emit_array_cell_return_unchanged(
+                    group.arr_tmp.clone(),
+                    group.idx_tmp.clone(),
+                ));
             }
         }
         for parent in self.pending_rows.split_off(rows_mark).into_iter().rev() {
@@ -7110,9 +7148,27 @@ impl<'a> Emitter<'a> {
                             .map(|ty| env.vtype_whnf(ty))
                             .is_some_and(|ty| matches!(ty.val, TypeT::Pointer(_, PointerKind::Ref)))
                     {
+                        // Bind a side-effecting index (`&a[i++]`) first: Pulse
+                        // would otherwise evaluate it twice, once for the call
+                        // and once for the `#s` refinement (#371). Pure indices
+                        // stay inline so user ghost code can mention them.
+                        let mut idx_doc = self.emit_rvalue(env, idx);
+                        let mut idx_bind = Doc::nil();
+                        if expr_may_have_side_effects(idx) {
+                            let idx_tmp = self.fresh_tmp("borrow_idx");
+                            idx_bind = Doc::text("let ")
+                                .append(idx_tmp.clone())
+                                .append(Doc::text(" ="))
+                                .append(Doc::line())
+                                .append(idx_doc)
+                                .append(";")
+                                .nest(2)
+                                .group()
+                                .append(Doc::hardline());
+                            idx_doc = idx_tmp;
+                        }
                         let arr_doc = self.emit_array_rvalue(env, arr);
-                        let idx_doc = self.emit_rvalue(env, idx);
-                        return self
+                        let assign = self
                             .emit_lvalue(env, x)
                             .append(Doc::line())
                             .append(":=")
@@ -7122,6 +7178,7 @@ impl<'a> Emitter<'a> {
                             .append(";")
                             .group()
                             .nest(2);
+                        return idx_bind.append(assign);
                     }
                     // `x = <arrayptr>` where `x` is a `ref` local: borrow the
                     // cell the arrayptr points at out of its (still-live) parent
@@ -11359,6 +11416,35 @@ impl<'a> Emitter<'a> {
 /// Append remaining statements to a block (for if/else continuation in pure functions).
 fn append_rest(block_stmts: &[Rc<Stmt>], rest: &[Rc<Stmt>]) -> Vec<Rc<Stmt>> {
     block_stmts.iter().chain(rest.iter()).cloned().collect()
+}
+
+/// Conservative check: false only for expressions built from variables,
+/// literals and side-effect-free operators (reads are not counted as effects).
+fn expr_may_have_side_effects(e: &Expr) -> bool {
+    match &e.val {
+        ExprT::Var(_)
+        | ExprT::BoolLit(_)
+        | ExprT::IntLit(..)
+        | ExprT::FloatLit(..)
+        | ExprT::FnRef(_)
+        | ExprT::SizeOf(_)
+        | ExprT::AlignOf(_) => false,
+        ExprT::Deref(a)
+        | ExprT::Member(a, _)
+        | ExprT::VAttr(_, a)
+        | ExprT::Ref(a)
+        | ExprT::UnOp(_, a)
+        | ExprT::Cast(a, _) => expr_may_have_side_effects(a),
+        ExprT::Index(a, b) | ExprT::BinOp(_, a, b) => {
+            expr_may_have_side_effects(a) || expr_may_have_side_effects(b)
+        }
+        ExprT::Cond(a, b, c) => {
+            expr_may_have_side_effects(a)
+                || expr_may_have_side_effects(b)
+                || expr_may_have_side_effects(c)
+        }
+        _ => true,
+    }
 }
 
 impl<'a> Emitter<'a> {

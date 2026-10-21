@@ -310,6 +310,11 @@ that read through pointers, such as `p->x < p->y`. In those cases, name the
 continuation flag with `_do_while_cond(name)` and state the needed relationship
 yourself, for example `_invariant(cont == (p->x < p->y))`.
 
+A side-effect-free constant-zero guard can be lowered straight-line when the
+body has no `break` or `continue` targeting that loop and no loop annotations
+or named control flags. Annotated `do ... while (0)` statements retain their
+loop obligations; an invalid invariant is not discarded.
+
 ### If postconditions and frames
 
 `_ensures(p)` may be attached to the body of an `if` statement. PAL emits it as
