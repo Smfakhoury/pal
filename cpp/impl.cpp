@@ -471,6 +471,7 @@ public:
 
   void HandleTranslationUnit(ASTContext &Context) override {
     collectLinkage(Context.getTranslationUnitDecl());
+    collectReadOnlyDefinitions(Context.getTranslationUnitDecl());
   }
 
   virtual bool HandleTopLevelDecl(DeclGroupRef DG) override {
@@ -1315,7 +1316,8 @@ public:
     return name ? name->getFunctionName() : nullptr;
   }
 
-  std::unordered_set<const FunctionDecl *> checkingReadOnlyFunctions;
+  bool collectingReadOnlyDefinition = false;
+  std::vector<const FunctionDecl *> readOnlyDependencies;
   std::unordered_map<const VarDecl *, std::string> staticLocalNames;
   std::unordered_set<const VarDecl *> emittedLocalStatics;
 
@@ -1369,18 +1371,9 @@ public:
     return false;
   }
 
-  bool knownReadOnlyCall(CallExpr *c) {
-    auto *fd = c->getDirectCallee();
-    auto *def = fd ? fd->getDefinition() : nullptr;
-    if (!def || fd->getBuiltinID() || def->isVariadic() ||
-        c->getNumArgs() != def->getNumParams() ||
-        !def->getReturnType()->isScalarType())
-      return false;
-    auto *callee = c->getCallee()->IgnoreParenImpCasts();
-    if (auto *u = dyn_cast<UnaryOperator>(callee);
-        u && u->getOpcode() == UO_AddrOf)
-      callee = u->getSubExpr()->IgnoreParenImpCasts();
-    if (!isa<DeclRefExpr>(callee))
+  bool supportedReadOnlyFunction(const FunctionDecl *fd) {
+    if (!fd || fd->getBuiltinID() || fd->isVariadic() ||
+        !fd->getReturnType()->isScalarType())
       return false;
     for (auto *d : fd->redecls()) {
       // Array parameter declarators can evaluate VLA bounds on entry or
@@ -1407,16 +1400,56 @@ public:
         name == "memset" || name.starts_with("__builtin_") ||
         name.starts_with("__pal_"))
       return false;
+    return true;
+  }
+
+  bool knownReadOnlyCall(CallExpr *c) {
+    auto *fd = c->getDirectCallee();
+    if (!supportedReadOnlyFunction(fd) || c->getNumArgs() != fd->getNumParams())
+      return false;
+    auto *callee = c->getCallee()->IgnoreParenImpCasts();
+    if (auto *u = dyn_cast<UnaryOperator>(callee);
+        u && u->getOpcode() == UO_AddrOf)
+      callee = u->getSubExpr()->IgnoreParenImpCasts();
+    if (!isa<DeclRefExpr>(callee))
+      return false;
     for (auto *arg : c->arguments())
       if (!canOmitVariadicArgument(arg) && !canEvaluateVariadicArgument(arg))
         return false;
-    // No recursive cycle may justify itself. Only complete, terminating
-    // return/if-return bodies qualify; annotations are not evidence of purity.
-    if (!checkingReadOnlyFunctions.insert(def).second)
-      return false;
-    bool result = readOnlyReturningBody(def->getBody());
-    checkingReadOnlyFunctions.erase(def);
-    return result;
+    if (collectingReadOnlyDefinition)
+      readOnlyDependencies.push_back(fd);
+    else
+      ctx.require_readonly(toStr(fd->getName()),
+                           !fd->hasExternalFormalLinkage(),
+                           getRange(c->getSourceRange()));
+    // Provisional only: all selected definitions and transitive dependencies
+    // must pass the post-parse check before this translation can be used.
+    return true;
+  }
+
+  void collectReadOnlyDefinitions(DeclContext *dc) {
+    for (auto *d : dc->decls()) {
+      auto *fd = dyn_cast<FunctionDecl>(d);
+      if (!fd)
+        continue;
+      if (!supportedReadOnlyFunction(fd))
+        ctx.forbid_readonly(toStr(fd->getName()),
+                            !fd->hasExternalFormalLinkage());
+      if (!fd->doesThisDeclarationHaveABody())
+        continue;
+      collectingReadOnlyDefinition = true;
+      readOnlyDependencies.clear();
+      bool supported =
+          supportedReadOnlyFunction(fd) && readOnlyReturningBody(fd->getBody());
+      collectingReadOnlyDefinition = false;
+      ctx.add_readonly_definition(toStr(fd->getName()),
+                                  !fd->hasExternalFormalLinkage(), supported);
+      for (auto *dependency : readOnlyDependencies)
+        ctx.add_readonly_dependency(toStr(fd->getName()),
+                                    !fd->hasExternalFormalLinkage(),
+                                    toStr(dependency->getName()),
+                                    !dependency->hasExternalFormalLinkage());
+    }
   }
 
   bool supportedAggregateEvaluationType(QualType ty) {

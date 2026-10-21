@@ -15,6 +15,7 @@ pub struct UnitSymbols {
     pub context: String,
     pub symbols: Vec<CSymbol>,
     pub local_static_names: HashMap<Rc<str>, HashSet<Rc<str>>>,
+    pub readonly: super::readonly::Facts,
 }
 
 pub struct CSymbol {

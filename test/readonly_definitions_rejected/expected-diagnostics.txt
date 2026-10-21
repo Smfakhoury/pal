@@ -1,0 +1,6 @@
+caller.c:12: unsupported ignored variadic argument
+caller.c:13: unsupported ignored variadic argument
+caller.c:14: unsupported ignored variadic argument
+caller.c:15: unsupported ignored variadic argument
+caller.c:16: unsupported ignored variadic argument
+caller.c:17: unsupported ignored variadic argument

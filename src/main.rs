@@ -197,6 +197,7 @@ fn main() {
         diags.merge(file_diags);
     }
     pass::linkage::prepare(&mut units, &mut diags);
+    pass::readonly::check(&units, &mut diags);
     for (tu, _) in units {
         combined_tu
             .main_file_names

@@ -195,6 +195,10 @@ mod crate::clang {
         fn set_linkage_context(&mut self, &str);
         fn add_c_symbol(&mut self, &str, u32, &str, bool, bool, bool, Rc<SourceInfo>);
         fn add_local_static(&mut self, &str, bool, &str);
+        fn require_readonly(&mut self, &str, bool, Rc<SourceInfo>);
+        fn forbid_readonly(&mut self, &str, bool);
+        fn add_readonly_definition(&mut self, &str, bool, bool);
+        fn add_readonly_dependency(&mut self, &str, bool, &str, bool);
 
         fn intern_str(&mut self, &str) -> Rc<str>;
 

@@ -122,6 +122,53 @@ impl<'a> Ctx<'a> {
             .insert(Rc::from(name));
     }
 
+    fn readonly_name(&self, name: &str, internal: bool) -> Rc<str> {
+        if internal {
+            Rc::from(format!("{}{name}", self.symbols.identity.prefix))
+        } else {
+            Rc::from(name)
+        }
+    }
+
+    fn require_readonly(&mut self, name: &str, internal: bool, loc: Rc<SourceInfo>) {
+        let name = self.readonly_name(name, internal);
+        self.symbols.readonly.requirements.push((name, loc));
+    }
+
+    fn forbid_readonly(&mut self, name: &str, internal: bool) {
+        let name = self.readonly_name(name, internal);
+        self.symbols.readonly.forbidden.insert(name);
+    }
+
+    fn add_readonly_definition(&mut self, name: &str, internal: bool, supported: bool) {
+        let name = self.readonly_name(name, internal);
+        self.symbols.readonly.definitions.insert(
+            name,
+            crate::pass::readonly::Definition {
+                supported,
+                dependencies: Vec::new(),
+            },
+        );
+    }
+
+    fn add_readonly_dependency(
+        &mut self,
+        owner: &str,
+        owner_internal: bool,
+        dependency: &str,
+        dependency_internal: bool,
+    ) {
+        let owner = self.readonly_name(owner, owner_internal);
+        let dependency = self.readonly_name(dependency, dependency_internal);
+        self.symbols
+            .readonly
+            .definitions
+            .get_mut(&owner)
+            .unwrap()
+            .dependencies
+            .push(dependency);
+    }
+
     fn intern_str(&mut self, s: &str) -> Rc<str> {
         match self.interned_strs.get(s) {
             Some(s) => s.clone(),

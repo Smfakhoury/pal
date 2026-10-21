@@ -59,7 +59,7 @@ before a caller returns: the returned expression is evaluated once into a
 temporary, cleanup runs, and the saved value is returned.
 
 Direct non-variadic accessor calls are supported only when a complete definition
-is visible and passes whole-body syntactic inspection. Accepted bodies consist
+is selected and passes whole-body syntactic inspection. Accepted bodies consist
 of a return, an if/else with returning branches, or an if-return followed by a
 return; return expressions and call arguments must recursively be read-only.
 Calls remain in the IR, so F* must verify their contracts and their definitions.
@@ -72,15 +72,22 @@ be justified by inspecting a return body alone.
 Supported examples include accessors returning field addresses and helpers selecting a
 pointer or a static object's address; no target bodies or values are inferred.
 
-Definition visibility is currently per Clang translation unit and declaration
-order: the body must already be parsed at the call site. Adding another source
-file to the same PAL command or compilation database does not make its body
-available to this classifier. PAL combines the resulting IR only after these
-checks. Aggregate-returning accessor calls remain outside the subset.
-`test/variadic_definition_visibility/` pins these conservative boundaries,
-including a definition parsed in an earlier input file and a later definition
-within the same file. Supporting cross-unit classification requires shared,
-definition-backed analysis and verification, not declaration-only purity claims.
+Evaluation classification is provisional while parsing. After all explicitly
+selected translation units have been parsed, PAL checks every requested accessor
+against emitted native definitions and their transitive call dependencies.
+Later definitions and definitions in another selected unit are supported;
+an entry in a compilation database without a selected source is not sufficient.
+Private functions retain their owning-unit identities. Every available definition
+must qualify, cycles are rejected, and unsupported declarations encountered later
+cannot be hidden by an earlier call. Existing linkage and compilation-context
+compatibility checks still apply. Missing bodies never establish purity.
+Aggregate-returning accessor calls remain outside the subset.
+`test/variadic_definition_visibility/` checks definition visibility and this
+aggregate-return boundary. `test/readonly_definitions/` verifies original bodies,
+native values, input orders and relocated module bytes, with expected failures for
+missing ownership, unchecked arithmetic and false contracts.
+`test/readonly_definitions_rejected/` rejects missing, mutating, recursive,
+transitively unsupported, incorrectly scoped and late-attributed callees.
 `test/variadic_aggregate_values/` verifies aggregate and null evaluation and
 requires missing ownership and unchecked overflow to fail.
 `test/variadic_aggregate_effects/` rejects mutation, unknown initializer calls,

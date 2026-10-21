@@ -8,4 +8,5 @@ pub mod linkage;
 pub mod merge;
 pub mod normalize_casts;
 pub mod prune;
+pub mod readonly;
 pub mod restructure_goto;
